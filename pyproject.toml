@@ -1,0 +1,23 @@
+[project]
+name = "pymint-ide"
+version = "0.1.0"
+description = "Ultra-lightweight native Python backend IDE optimized for Linux Mint"
+authors = [{ name = "PyMint Team" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "jedi>=0.20.0",
+]
+
+[project.optional-dependencies]
+wheels = [
+    "PyQt6>=6.4.0",
+    "PyQt6-QScintilla>=2.14.0",
+]
+
+[project.scripts]
+pymint = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
