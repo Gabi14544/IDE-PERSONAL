@@ -14,6 +14,10 @@ IDE nativo para Python y Rust en Linux. La interfaz usa PyQt6 y QScintilla; la t
 
 La terminal procesa entrada y salida sin bloquear, conserva las secuencias UTF-8 y ANSI entre lecturas y muestra colores, negrita, cursiva y subrayado. El historial está limitado a 2000 líneas por sesión. Las actualizaciones se agrupan cada 33 ms y solo se reemplaza el texto que cambió; el historial antiguo se elimina de forma incremental. La selección y la posición de lectura se mantienen mientras llega salida nueva.
 
+Al achicar el panel, las filas desplazadas pasan al historial y se recuperan al ampliarlo. Las líneas ya impresas conservan su ancho y se pueden desplazar horizontalmente. Ocultar el panel o minimizar la ventana mantiene el último tamaño útil de la terminal y sigue recogiendo la salida del proceso. Los cambios de tamaño se agrupan para evitar redibujos y señales repetidas mientras se arrastra el divisor.
+
+Una barra de cursor muestra la posición real de escritura, incluso cuando el documento es de solo lectura. Se mantiene separada de la selección del mouse y respeta las instrucciones de los programas para mostrar u ocultar el cursor.
+
 Los procesos reciben el tamaño real de la terminal y `Ctrl+C` interrumpe el trabajo en primer plano. Los procesos terminados se recogen para evitar shells zombis. El menú contextual y `Ctrl+Shift+C` / `Ctrl+Shift+V` permiten copiar y pegar.
 
 Jedi se carga en segundo plano al solicitar el primer autocompletado. El explorador evita iconos personalizados de carpetas y usa filas de altura uniforme. Git se consulta al abrir su panel y los servicios del sistema al abrir su menú; no se lanzan esas consultas al iniciar el IDE. La interfaz no usa animaciones ni efectos de composición.
@@ -59,6 +63,6 @@ QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests -v
 python tests/benchmark_terminal.py
 ```
 
-Las pruebas funcionales cubren ejecución y guardado, rutas con caracteres especiales, selección del intérprete, bloqueo de ejecuciones simultáneas, cierre con cambios pendientes, tamaños de ventana reducidos, autocompletado Jedi y terminal real: entrada, salida abundante, colores ANSI, secuencias partidas, redimensionado, interrupción, historial y recogida de procesos.
+Las pruebas funcionales cubren ejecución y guardado, rutas con caracteres especiales, selección del intérprete, bloqueo de ejecuciones simultáneas, cierre con cambios pendientes, tamaños de ventana reducidos, autocompletado Jedi y terminal real: entrada, salida abundante, colores ANSI, secuencias partidas, redimensionado, interrupción, historial y recogida de procesos. También verifican que un servidor HTTP siga respondiendo y conservando sus mensajes al achicar, ocultar y minimizar la terminal, y comprueban la posición y el dibujo del cursor.
 
 El modo `offscreen` permite validar sin un escritorio. La apariencia y el rendimiento final deben comprobarse también en el equipo físico. La terminal implementa el subconjunto VT soportado por pyte; no pretende sustituir todas las funciones de un emulador de terminal dedicado.

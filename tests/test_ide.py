@@ -2,6 +2,7 @@
 
 import fcntl
 import os
+import re
 from pathlib import Path
 import struct
 import sys
@@ -9,6 +10,7 @@ import tempfile
 import termios
 import time
 import unittest
+import urllib.request
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -16,14 +18,14 @@ _config = tempfile.TemporaryDirectory()
 os.environ["XDG_CONFIG_HOME"] = _config.name
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QTextCursor
+from PyQt6.QtGui import QColor, QTextCursor
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QPushButton, QMessageBox
 
 from core.execution import command_for_file
 from core.lsp_worker import LSPWorker
 from ui.main_window import MainWindow
-from ui.terminal_panel import PTYTerminalWidget, TerminalScreen
+from ui.terminal_panel import PTYTerminalWidget, TerminalScreen, snapshot
 
 app = QApplication.instance() or QApplication([])
 app.setStyle("Fusion")
@@ -57,6 +59,166 @@ class TerminalTests(unittest.TestCase):
         widget.show()
         app.processEvents()
         return widget
+
+    def wait_for_resize(self, widget):
+        wait_for(lambda: not widget._resize_timer.isActive() and not widget._resizing)
+
+    def test_shrinking_and_growing_preserve_logs_colors_and_cursor(self):
+        import pyte
+
+        screen = TerminalScreen(80, 24)
+        pyte.ByteStream(screen).feed(
+            b"\x1b[32mApplication startup complete\x1b[0m\r\n"
+            b"Listening on http://127.0.0.1:8000\r\n"
+            b"Finished cargo build\r\n"
+        )
+        original = [snapshot(screen.buffer[y], screen.columns) for y in range(4)]
+        for _ in range(3):
+            screen.resize(lines=3, columns=20)
+            rows = list(screen.history_rows) + [
+                snapshot(screen.buffer[y], screen.columns) for y in range(screen.lines)
+            ]
+            self.assertEqual(rows, original)
+            self.assertEqual(len(screen.history_rows) + screen.cursor.y, 3)
+            screen.resize(lines=24, columns=80)
+            self.assertEqual(len(screen.history_rows), 0)
+            self.assertEqual(screen.cursor.y, 3)
+            self.assertEqual(
+                [snapshot(screen.buffer[y], screen.columns) for y in range(4)], original
+            )
+
+    def test_idle_output_near_top_is_not_removed_by_a_shorter_viewport(self):
+        widget = self.terminal()
+        widget.resize(900, 500)
+        self.wait_for_resize(widget)
+        widget.stream.feed(b"FastAPI ready\r\nCargo server ready\r\n")
+        widget._render_screen()
+        original = widget.toPlainText()
+        for width, height in ((460, 90), (900, 500), (500, 110), (900, 500)):
+            widget.resize(width, height)
+            self.wait_for_resize(widget)
+            self.assertEqual(widget.toPlainText(), original)
+            self.assertTrue(widget._follow_output)
+
+    def test_running_http_server_survives_resize_hide_and_minimize(self):
+        widget = self.terminal(
+            "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+            "class Handler(BaseHTTPRequestHandler):\n"
+            " def do_GET(self):\n"
+            "  self.send_response(200); self.end_headers(); self.wfile.write(b'OK')\n"
+            "server = HTTPServer(('127.0.0.1', 0), Handler)\n"
+            "for i in range(20): print('startup-record', i)\n"
+            "print('READY', server.server_port, flush=True)\n"
+            "server.serve_forever()"
+        )
+        self.wait_for_resize(widget)
+        wait_for(lambda: re.search(r"READY (\d+)", widget.toPlainText()))
+        port = int(re.search(r"READY (\d+)", widget.toPlainText()).group(1))
+        pid = widget.pid
+        records = [f"startup-record {index}" for index in range(20)]
+        widget.resize(450, 85)
+        self.wait_for_resize(widget)
+        self.assertEqual(
+            widget.verticalScrollBar().value(), widget.verticalScrollBar().maximum()
+        )
+        grid = (widget.screen.lines, widget.screen.columns)
+        widget.hide()
+        widget.resize(120, 30)
+        widget._sync_size()
+        self.assertEqual((widget.screen.lines, widget.screen.columns), grid)
+
+        client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with client.open(
+            f"http://127.0.0.1:{port}/while-hidden", timeout=2
+        ) as response:
+            self.assertEqual(response.read(), b"OK")
+        # Narrow terminals legitimately wrap the HTTP request across rows.
+        wait_for(lambda: "/while-hidden" in widget.toPlainText().replace("\n", ""))
+        widget.resize(900, 500)
+        widget.show()
+        self.wait_for_resize(widget)
+        grid = (widget.screen.lines, widget.screen.columns)
+        widget.showMinimized()
+        app.processEvents()
+        widget._sync_size()
+        self.assertEqual((widget.screen.lines, widget.screen.columns), grid)
+        widget.showNormal()
+        self.wait_for_resize(widget)
+        with client.open(
+            f"http://127.0.0.1:{port}/after-restore", timeout=2
+        ) as response:
+            self.assertEqual(response.status, 200)
+        wait_for(lambda: "/after-restore" in widget.toPlainText())
+        self.assertTrue(all(record in widget.toPlainText() for record in records))
+        self.assertEqual(
+            widget.verticalScrollBar().value(), widget.verticalScrollBar().maximum()
+        )
+        self.assertEqual(widget.pid, pid)
+        self.assertIsNone(widget._process.poll())
+
+    def test_user_scrollback_position_survives_resize(self):
+        widget = self.terminal()
+        self.wait_for_resize(widget)
+        widget.stream.feed(b"history record\r\n" * 100)
+        widget._render_screen()
+        widget.verticalScrollBar().setValue(10)
+        self.assertFalse(widget._follow_output)
+        widget.resize(500, 100)
+        self.wait_for_resize(widget)
+        self.assertFalse(widget._follow_output)
+        self.assertEqual(widget.verticalScrollBar().value(), 10)
+        widget.stream.feed(b"new server message\r\n")
+        widget._render_screen()
+        self.assertEqual(widget.verticalScrollBar().value(), 10)
+
+    def test_real_cursor_position_is_visible_and_respects_terminal_modes(self):
+        widget = self.terminal()
+        self.wait_for_resize(widget)
+        widget.stream.feed("café λ".encode())
+        widget._render_screen()
+        self.assertFalse(widget._terminal_cursor_rect().isEmpty())
+        self.assertTrue(
+            widget._terminal_cursor_rect().intersects(widget.viewport().rect())
+        )
+        original = widget._terminal_cursor_rect()
+        image = widget.viewport().grab().toImage()
+        color = (
+            widget.theme["editor_caret"]
+            if widget.hasFocus()
+            else widget.theme["text_muted"]
+        )
+        self.assertEqual(image.pixelColor(original.center()), QColor(color))
+        widget.stream.feed(b"\x1b[2D")
+        widget._render_screen()
+        self.assertLess(widget._terminal_cursor_rect().x(), original.x())
+        # Mouse selection does not change the position tracked by the PTY.
+        cursor = QTextCursor(widget.document())
+        cursor.setPosition(0)
+        widget.setTextCursor(cursor)
+        position = widget._terminal_cursor_rect().x()
+        self.assertGreater(position, widget.cursorRect(cursor).x())
+        widget.stream.feed(b"\x1b[?25l")
+        widget._render_screen()
+        self.assertTrue(widget._terminal_cursor_rect().isEmpty())
+        widget.stream.feed(b"\x1b[?25h\x1b[15G")
+        widget._render_screen()
+        self.assertGreater(widget._terminal_cursor_rect().x(), original.x())
+
+    def test_resize_is_coalesced_and_notifies_pty_with_final_dimensions(self):
+        widget = self.terminal()
+        self.wait_for_resize(widget)
+        with patch.object(
+            widget.screen, "resize", wraps=widget.screen.resize
+        ) as resize:
+            for height in range(200, 400, 10):
+                widget.resize(720, height)
+                app.processEvents()
+            self.wait_for_resize(widget)
+            self.assertEqual(resize.call_count, 1)
+        rows, columns, _, _ = struct.unpack(
+            "HHHH", fcntl.ioctl(widget.master_fd, termios.TIOCGWINSZ, b"\0" * 8)
+        )
+        self.assertEqual((rows, columns), (widget.screen.lines, widget.screen.columns))
 
     def test_split_utf8_and_escape_sequences_keep_colors(self):
         widget = self.terminal()
@@ -207,6 +369,10 @@ class WorkspaceTests(unittest.TestCase):
             )
         )
         self.assertEqual(sum("Ejecutar" in text for text in buttons), 1)
+        # The workspace's generic QWidget font must not override the PTY grid font.
+        metrics = window.terminal_panel.current_terminal().fontMetrics()
+        self.assertEqual(metrics.horizontalAdvance("M"), metrics.horizontalAdvance("i"))
+        self.assertEqual(metrics.horizontalAdvance("M"), metrics.horizontalAdvance(" "))
         for width, height in ((1280, 680), (960, 600), (640, 400)):
             window.resize(width, height)
             app.processEvents()
@@ -214,6 +380,45 @@ class WorkspaceTests(unittest.TestCase):
             self.assertLessEqual(window.height(), height)
         self.assertFalse(window.service_guard._check_processes)
         self.assertFalse(window.git_manager._active_processes)
+
+    def test_active_run_output_survives_panel_collapse_and_window_minimize(self):
+        panel = self.window.terminal_panel
+        panel.run_command(
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                "import time\nfor i in range(12): print('running-record', i)\n"
+                "print('WAITING', flush=True)\nprint(input(), flush=True)\ntime.sleep(30)",
+            ],
+            str(self.root),
+            "Server",
+        )
+        runner = panel.current_terminal()
+        wait_for(lambda: "WAITING" in runner.toPlainText())
+        pid = runner.pid
+        self.window.v_splitter.setSizes([580, 90])
+        wait_for(lambda: not runner._resize_timer.isActive() and not runner._resizing)
+        self.window._toggle_terminal()
+        app.processEvents()
+        self.assertFalse(self.window.terminal_island.isVisible())
+        runner.write_to_pty("STILL_RUNNING\r")
+        wait_for(lambda: "STILL_RUNNING" in runner.toPlainText())
+        self.window._toggle_terminal()
+        self.window.v_splitter.setSizes([400, 260])
+        wait_for(lambda: not runner._resize_timer.isActive() and not runner._resizing)
+        self.window.showMinimized()
+        app.processEvents()
+        self.window.showNormal()
+        wait_for(lambda: not runner._resize_timer.isActive() and not runner._resizing)
+        self.assertTrue(
+            all(f"running-record {i}" in runner.toPlainText() for i in range(12))
+        )
+        self.assertIn("STILL_RUNNING", runner.toPlainText())
+        self.assertEqual(runner.pid, pid)
+        self.assertEqual(
+            runner.verticalScrollBar().value(), runner.verticalScrollBar().maximum()
+        )
 
     def test_run_saves_and_handles_hostile_filename_without_touching_shell(self):
         path = self.root / "code '$ weird.py"

@@ -1,7 +1,7 @@
 """Bounded PTY sessions with batched, incremental Qt rendering."""
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import errno
 import fcntl
 import os
@@ -15,8 +15,23 @@ import sys
 from pathlib import Path
 
 import pyte
-from PyQt6.QtCore import Qt, QSocketNotifier, QTimer, pyqtSignal, QProcess
-from PyQt6.QtGui import QColor, QFont, QTextCursor, QTextCharFormat, QSyntaxHighlighter
+from PyQt6.QtCore import (
+    Qt,
+    QEvent,
+    QRect,
+    QSocketNotifier,
+    QTimer,
+    pyqtSignal,
+    QProcess,
+)
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QPainter,
+    QTextCursor,
+    QTextCharFormat,
+    QSyntaxHighlighter,
+)
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -38,11 +53,15 @@ class TerminalRow:
     text: str
     # (UTF-16 offset, length, pyte character attributes)
     runs: tuple = ()
+    # Keep cell attributes so rows can return from scrollback when the pane grows.
+    cells: tuple = field(default=(), compare=False, repr=False)
 
 
 def snapshot(row, columns):
     """Freeze one changed row; history never retains mutable screen buffers."""
-    last = min(columns - 1, max(row.keys(), default=-1))
+    # Existing output keeps its original width. A narrower viewport can scroll
+    # horizontally; resizing must not crop the right side of previously printed logs.
+    last = max(row.keys(), default=-1)
     chars = [row[index] for index in range(last + 1)]
     while chars and chars[-1].data == " " and chars[-1].bg == "default":
         chars.pop()
@@ -66,7 +85,7 @@ def snapshot(row, columns):
             else:
                 runs.append((offset, length, style))
         offset += length
-    return TerminalRow(text, tuple(runs))
+    return TerminalRow(text, tuple(runs), tuple(chars))
 
 
 class TerminalScreen(pyte.Screen):
@@ -80,10 +99,81 @@ class TerminalScreen(pyte.Screen):
     def index(self):
         top, bottom = self.margins or pyte.screens.Margins(0, self.lines - 1)
         if self.cursor.y == bottom and top == 0 and bottom == self.lines - 1:
-            if len(self.history_rows) == self.history_rows.maxlen:
-                self.history_dropped += 1
-            self.history_rows.append(snapshot(self.buffer[top], self.columns))
+            self._archive(self.buffer[top])
         super().index()
+
+    def _archive(self, row):
+        if len(self.history_rows) == self.history_rows.maxlen:
+            self.history_dropped += 1
+        self.history_rows.append(snapshot(row, self.columns))
+
+    def resize(self, lines=None, columns=None):
+        """Keep output and the cursor together instead of clipping rows at the top.
+
+        Discard unused bottom space first, archive displaced rows when shrinking,
+        and bring history back into the screen when growing. Width changes apply
+        to new output; existing rows retain their cells until explicitly erased.
+        """
+        lines = max(1, lines if lines is not None else self.lines)
+        columns = max(1, columns if columns is not None else self.columns)
+        if (lines, columns) == (self.lines, self.columns):
+            return
+
+        shift = 0
+        if lines < self.lines:
+            used = max(
+                self.cursor.y + 1,
+                max(
+                    (
+                        y + 1
+                        for y, row in self.buffer.items()
+                        if any(
+                            char.data != " " or char.bg != "default"
+                            for char in row.values()
+                        )
+                    ),
+                    default=0,
+                ),
+            )
+            removed = max(0, used - lines)
+            for y in range(removed):
+                self._archive(self.buffer[y])
+            retained = {
+                y - removed: row
+                for y, row in self.buffer.items()
+                if removed <= y < removed + lines
+            }
+            self.buffer.clear()
+            self.buffer.update(retained)
+            shift = -removed
+        elif lines > self.lines:
+            restored = min(lines - self.lines, len(self.history_rows))
+            rows = [self.history_rows.pop() for _ in range(restored)][::-1]
+            retained = {y + restored: row for y, row in self.buffer.items()}
+            self.buffer.clear()
+            for y, row in enumerate(rows):
+                self.buffer[y].update(enumerate(row.cells))
+            self.buffer.update(retained)
+            shift = restored
+
+        self.lines, self.columns = lines, columns
+        self.margins = None
+        self.cursor.y = max(0, min(lines - 1, self.cursor.y + shift))
+        # x == columns is pyte's pending-autowrap position.
+        self.cursor.x = min(self.cursor.x, columns)
+        for saved in self.savepoints:
+            saved.cursor.y = max(0, min(lines - 1, saved.cursor.y + shift))
+            saved.cursor.x = min(saved.cursor.x, columns)
+        self.dirty.update(range(lines))
+
+    def erase_in_line(self, how=0, private=False):
+        super().erase_in_line(how, private)
+        if how in (0, 2):
+            # A shell repaint after SIGWINCH also clears preserved wide tails.
+            row = self.buffer[self.cursor.y]
+            for x in list(row):
+                if x >= self.columns:
+                    row.pop(x)
 
     def erase_in_display(self, how=0, *args, **kwargs):
         if how == 3:
@@ -174,7 +264,14 @@ class PTYTerminalWidget(QPlainTextEdit):
         self._visible_rows = {}
         self._render_count = 0
         self._closed = False
+        self._follow_output = True
+        self._rendering = False
+        self._resizing = False
+        self._caret_rect = QRect()
         self.command = command
+        self._terminal_font = QFont(
+            settings.get_font_family(), settings.get_font_size()
+        )
         self.screen = TerminalScreen()
         self.stream = pyte.ByteStream(self.screen)
         self.screen.write_process_input = self.write_to_pty
@@ -182,14 +279,24 @@ class PTYTerminalWidget(QPlainTextEdit):
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(33)
         self._render_timer.timeout.connect(self._render_screen)
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(60)
+        self._resize_timer.timeout.connect(self._sync_size)
         self._reap_timer = QTimer(self)
         self._reap_timer.setInterval(250)
         self._reap_timer.timeout.connect(self._check_child)
         self.setReadOnly(True)
+        # Qt hides its editing caret in read-only documents. Paint the PTY's
+        # cursor separately, so selection and mouse clicks cannot move it.
+        self.setCursorWidth(0)
         self.setUndoRedoEnabled(False)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.document().setDocumentMargin(8)
         self.highlighter = TerminalHighlighter(self)
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self.horizontalScrollBar().valueChanged.connect(self._update_caret)
+        self.selectionChanged.connect(self._update_caret)
         self.apply_theme(
             self.theme, QFont(settings.get_font_family(), settings.get_font_size())
         )
@@ -198,10 +305,20 @@ class PTYTerminalWidget(QPlainTextEdit):
     def apply_theme(self, theme_dict, font=None):
         self.theme = theme_dict
         if font:
-            self.setFont(font)
+            self._terminal_font = QFont(font)
+        self._terminal_font.setStyleHint(QFont.StyleHint.Monospace)
+        self._terminal_font.setFixedPitch(True)
+        self.setFont(self._terminal_font)
+        family = self._terminal_font.family().replace("\\", "\\\\").replace('"', '\\"')
+        size = (
+            f"{self._terminal_font.pointSizeF()}pt"
+            if self._terminal_font.pointSizeF() > 0
+            else f"{self._terminal_font.pixelSize()}px"
+        )
         self.setStyleSheet(f"""
             QPlainTextEdit {{ background: {self.theme["terminal_bg"]}; color: {self.theme["terminal_fg"]};
-                selection-background-color: {self.theme["editor_selection"]}; border: none; padding: 0; }}
+                selection-background-color: {self.theme["editor_selection"]}; border: none; padding: 0;
+                font-family: "{family}"; font-size: {size}; }}
         """)
         self.highlighter._formats.clear()
         self.highlighter.rehighlight()
@@ -276,6 +393,14 @@ class PTYTerminalWidget(QPlainTextEdit):
 
     def _render_screen(self):
         self._render_timer.stop()
+        self._rendering = True
+        try:
+            self._update_document()
+        finally:
+            self._rendering = False
+        self._update_caret()
+
+    def _update_document(self):
         for line in range(self.screen.lines):
             if line in self.screen.dirty or line not in self._visible_rows:
                 self._visible_rows[line] = snapshot(
@@ -288,10 +413,7 @@ class PTYTerminalWidget(QPlainTextEdit):
         rows = list(self.screen.history_rows) + visible
         old = self._rows
         scrollbar = self.verticalScrollBar()
-        follow = (
-            scrollbar.value() >= scrollbar.maximum() - 2
-            and not self.textCursor().hasSelection()
-        )
+        follow = self._follow_output and not self.textCursor().hasSelection()
         dropped = self.screen.history_dropped - self._history_dropped
         self._history_dropped = self.screen.history_dropped
         scroll_value = max(0, scrollbar.value() - dropped)
@@ -341,11 +463,69 @@ class PTYTerminalWidget(QPlainTextEdit):
                 column = min(len(text.encode("utf-16-le")) // 2, block.length() - 1)
                 cursor.setPosition(block.position() + column)
                 self.setTextCursor(cursor)
+                self.ensureCursorVisible()
             scrollbar.setValue(scrollbar.maximum())
         else:
             if selection.hasSelection():
                 self.setTextCursor(selection)
             scrollbar.setValue(scroll_value)
+
+    def _on_scroll(self, value):
+        # Layout changes must not look like the user scrolling away from output.
+        if not self._rendering and not self._resizing and self.isVisible():
+            self._follow_output = value >= self.verticalScrollBar().maximum() - 2
+        self._update_caret()
+
+    def _terminal_cursor_rect(self):
+        if (
+            self._closed
+            or self.screen.cursor.hidden
+            or self.textCursor().hasSelection()
+        ):
+            return QRect()
+        block = self.document().findBlockByNumber(
+            len(self.screen.history_rows) + self.screen.cursor.y
+        )
+        if not block.isValid():
+            return QRect()
+        row = self.screen.buffer[self.screen.cursor.y]
+        before = "".join(row[col].data for col in range(self.screen.cursor.x))
+        offset = len(before.encode("utf-16-le")) // 2
+        text_length = block.length() - 1
+        cursor = QTextCursor(block)
+        cursor.setPosition(block.position() + min(offset, text_length))
+        rect = self.cursorRect(cursor)
+        # The PTY may position its cursor beyond the last printed character.
+        rect.translate(
+            max(0, offset - text_length) * self.fontMetrics().horizontalAdvance("M"), 0
+        )
+        rect.setWidth(2)
+        return rect
+
+    def _update_caret(self):
+        old = self._caret_rect
+        self._caret_rect = self._terminal_cursor_rect()
+        self.viewport().update(old.united(self._caret_rect).adjusted(-1, -1, 1, 1))
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        rect = self._terminal_cursor_rect()
+        if rect.intersects(self.viewport().rect()):
+            color = QColor(
+                self.theme["editor_caret"]
+                if self.hasFocus()
+                else self.theme["text_muted"]
+            )
+            painter = QPainter(self.viewport())
+            painter.fillRect(rect, color)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self._update_caret()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self._update_caret()
 
     def write_to_pty(self, text):
         if self.master_fd is None:
@@ -430,6 +610,17 @@ class PTYTerminalWidget(QPlainTextEdit):
         event.accept()
 
     def _sync_size(self):
+        try:
+            # Hidden panels and minimized windows keep their last usable grid.
+            # Output continues to be read and archived while they are hidden.
+            if not self.isVisible() or self.window().isMinimized() or self._closed:
+                return
+            self._apply_viewport_size()
+            self._render_screen()
+        finally:
+            self._resizing = False
+
+    def _apply_viewport_size(self):
         metrics = self.fontMetrics()
         cols = max(
             20, (self.viewport().width() - 16) // max(1, metrics.horizontalAdvance("M"))
@@ -438,20 +629,37 @@ class PTYTerminalWidget(QPlainTextEdit):
         if (self.screen.lines, self.screen.columns) != (lines, cols):
             self.screen.resize(lines, cols)
             self._visible_rows.clear()
-            self._render_timer.start()
-        if self.master_fd is not None:
-            try:
-                fcntl.ioctl(
-                    self.master_fd,
-                    termios.TIOCSWINSZ,
-                    struct.pack("HHHH", lines, cols, 0, 0),
-                )
-            except OSError:
-                pass
+            if self.master_fd is not None:
+                try:
+                    fcntl.ioctl(
+                        self.master_fd,
+                        termios.TIOCSWINSZ,
+                        struct.pack("HHHH", lines, cols, 0, 0),
+                    )
+                except OSError:
+                    pass
 
     def resizeEvent(self, event):
+        self._resizing = True
         super().resizeEvent(event)
-        self._sync_size()
+        self._resize_timer.start()
+
+    def showEvent(self, event):
+        self._resizing = True
+        super().showEvent(event)
+        self.window().installEventFilter(self)
+        self._resize_timer.start()
+
+    def hideEvent(self, event):
+        self._resize_timer.stop()
+        self._resizing = False
+        super().hideEvent(event)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._resizing = True
+            self._resize_timer.start()
+        return super().eventFilter(watched, event)
 
     def _check_child(self):
         if not self.pid:
@@ -477,6 +685,7 @@ class PTYTerminalWidget(QPlainTextEdit):
         if not self._closed:
             self._closed = True
             self._render_timer.stop()
+            self._resize_timer.stop()
             groups = set()
             if self.master_fd is not None:
                 try:
