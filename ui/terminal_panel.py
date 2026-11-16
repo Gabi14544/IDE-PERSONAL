@@ -1,20 +1,22 @@
-"""
-PyMint IDE - Native Linux PTY Terminal Panel
-Integrated VT100 terminal engine powered by pyte.
-Full support for Zsh / Oh My Zsh, zero local duplicate echo,
-correct Backspace / line-editing handling, no VT100 keypad artifact characters (=, >),
-and seamless external Linux Mint terminal launcher.
-"""
+"""Bounded PTY sessions with batched, incremental Qt rendering."""
 
+from collections import deque
+from dataclasses import dataclass
+import errno
+import fcntl
 import os
-import pty
-import re
+import shlex
+import shutil
 import signal
 import struct
-import fcntl
 import termios
-import shutil
+import subprocess
+import sys
+from pathlib import Path
+
 import pyte
+from PyQt6.QtCore import Qt, QSocketNotifier, QTimer, pyqtSignal, QProcess
+from PyQt6.QtGui import QColor, QFont, QTextCursor, QTextCharFormat, QSyntaxHighlighter
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -24,620 +26,624 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QLabel,
     QApplication,
+    QMenu,
 )
-from PyQt6.QtCore import Qt, QSocketNotifier, pyqtSignal, QProcess
-from PyQt6.QtGui import (
-    QColor,
-    QFont,
-    QTextCursor,
-    QTextCharFormat,
-    QKeyEvent,
-    QSyntaxHighlighter,
-)
+
 from core.config import settings
 from ui.themes import get_theme
 
 
-OSC_REGEX = re.compile(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-KEYPAD_REGEX = re.compile(rb"\x1b[=>]")
+@dataclass(frozen=True)
+class TerminalRow:
+    text: str
+    # (UTF-16 offset, length, pyte character attributes)
+    runs: tuple = ()
 
 
-class TerminalScreen(pyte.HistoryScreen):
-    """
-    Subclass of pyte.HistoryScreen that maintains an efficient scrollback string history.
-    Lines scrolling off the top of the screen are archived directly as strings.
-    """
+def snapshot(row, columns):
+    """Freeze one changed row; history never retains mutable screen buffers."""
+    last = min(columns - 1, max(row.keys(), default=-1))
+    chars = [row[index] for index in range(last + 1)]
+    while chars and chars[-1].data == " " and chars[-1].bg == "default":
+        chars.pop()
+    text = "".join(char.data for char in chars)
+    runs = []
+    offset = 0
+    for char in chars:
+        length = len(char.data.encode("utf-16-le")) // 2
+        style = (
+            char.fg,
+            char.bg,
+            char.bold,
+            char.italics,
+            char.underscore,
+            char.reverse,
+        )
+        if length:
+            if runs and runs[-1][2] == style:
+                start, count, _ = runs[-1]
+                runs[-1] = (start, count + length, style)
+            else:
+                runs.append((offset, length, style))
+        offset += length
+    return TerminalRow(text, tuple(runs))
 
-    def __init__(self, cols: int, lines: int, history: int = 1000):
-        super().__init__(cols, lines, history=history)
-        self.history_lines = []
+
+class TerminalScreen(pyte.Screen):
+    """A single bounded scrollback, instead of duplicating pyte's history."""
+
+    def __init__(self, cols=80, lines=24, history=2000):
+        self.history_rows = deque(maxlen=history)
+        self.history_dropped = 0
+        super().__init__(cols, lines)
 
     def index(self):
         top, bottom = self.margins or pyte.screens.Margins(0, self.lines - 1)
-        if self.cursor.y == bottom:
-            row = self.buffer[top]
-            max_col = max(row.keys(), default=-1)
-            line_str = "".join(row[c].data for c in range(max_col + 1)).rstrip() if max_col >= 0 else ""
-            self.history_lines.append(line_str)
-            if len(self.history_lines) > 2000:
-                self.history_lines.pop(0)
+        if self.cursor.y == bottom and top == 0 and bottom == self.lines - 1:
+            if len(self.history_rows) == self.history_rows.maxlen:
+                self.history_dropped += 1
+            self.history_rows.append(snapshot(self.buffer[top], self.columns))
         super().index()
+
+    def erase_in_display(self, how=0, *args, **kwargs):
+        if how == 3:
+            self.history_dropped += len(self.history_rows)
+            self.history_rows.clear()
+        super().erase_in_display(how, *args, **kwargs)
+
+    def reset(self):
+        self.history_dropped += len(self.history_rows)
+        self.history_rows.clear()
+        super().reset()
 
 
 class TerminalHighlighter(QSyntaxHighlighter):
-    """Lightweight prompt highlighter for Oh My Zsh tokens (green arrow, git branch, status)."""
+    """Render the terminal's real SGR colors, rather than guessing from prompt text."""
 
-    def __init__(self, theme_dict: dict, parent=None):
-        super().__init__(parent)
-        self.theme = theme_dict
-        self._update_rules()
+    COLORS = {
+        "black": "#454b59",
+        "red": "#e27881",
+        "green": "#a2c98d",
+        "brown": "#e5bc8a",
+        "blue": "#82aaff",
+        "magenta": "#c3a6ff",
+        "cyan": "#89cdd0",
+        "white": "#dce1ea",
+        "brightblack": "#7b8797",
+        "brightred": "#ff9a9e",
+        "brightgreen": "#b5dfa0",
+        "brightbrown": "#f4d19e",
+        "brightblue": "#a3bfff",
+        "brightmagenta": "#d4beff",
+        "brightcyan": "#a2e4e6",
+        "brightwhite": "#ffffff",
+    }
 
-    def update_theme(self, theme_dict: dict):
-        self.theme = theme_dict
-        self._update_rules()
-        self.rehighlight()
+    def __init__(self, terminal):
+        super().__init__(terminal.document())
+        self.terminal = terminal
+        self._formats = {}
 
-    def _update_rules(self):
-        self.rules = []
-        th = self.theme
+    def color(self, value, fallback):
+        if value == "default":
+            return QColor(fallback)
+        return QColor(self.COLORS.get(value, f"#{value}"))
 
-        # Green prompt arrow (➜)
-        fmt_green = QTextCharFormat()
-        fmt_green.setForeground(QColor(th.get("green", "#59A869")))
-        fmt_green.setFontWeight(QFont.Weight.Bold)
-        self.rules.append((re.compile(r"➜"), fmt_green))
-
-        # Blue git repository & branch badge: git:(master)
-        fmt_blue = QTextCharFormat()
-        fmt_blue.setForeground(QColor(th.get("syntax_func", th.get("blue", "#3B82F6"))))
-        self.rules.append((re.compile(r"git:\([^)]*\)"), fmt_blue))
-
-        # Red dirty symbol (✗)
-        fmt_red = QTextCharFormat()
-        fmt_red.setForeground(QColor(th.get("red", "#E06C75")))
-        fmt_red.setFontWeight(QFont.Weight.Bold)
-        self.rules.append((re.compile(r"✗"), fmt_red))
-
-        # Teal directory name in prompt
-        fmt_teal = QTextCharFormat()
-        fmt_teal.setForeground(QColor(th.get("teal", "#2AACB8")))
-        self.rules.append((re.compile(r"(?:~|/)[a-zA-Z0-9_\-\./]+"), fmt_teal))
-
-    def highlightBlock(self, text: str):
-        for pattern, fmt in self.rules:
-            for match in pattern.finditer(text):
-                self.setFormat(match.start(), match.end() - match.start(), fmt)
+    def highlightBlock(self, text):
+        index = self.currentBlock().blockNumber()
+        rows = self.terminal._rows
+        if index >= len(rows):
+            return
+        for start, length, style in rows[index].runs:
+            fmt = self._formats.get(style)
+            if fmt is None:
+                fg, bg, bold, italic, underline, reverse = style
+                theme = self.terminal.theme
+                foreground = self.color(fg, theme["terminal_fg"])
+                background = self.color(bg, theme["terminal_bg"])
+                if reverse:
+                    foreground, background = background, foreground
+                fmt = QTextCharFormat()
+                fmt.setForeground(foreground)
+                fmt.setBackground(background)
+                fmt.setFontWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
+                fmt.setFontItalic(italic)
+                fmt.setFontUnderline(underline)
+                # Bound the cache even for programs emitting many true colors.
+                if len(self._formats) >= 512:
+                    self._formats.clear()
+                self._formats[style] = fmt
+            self.setFormat(start, length, fmt)
 
 
 class PTYTerminalWidget(QPlainTextEdit):
-    """VT100 PTY Terminal session driven by pyte state engine."""
+    session_finished = pyqtSignal(int)
 
-    def __init__(self, cwd: str = "", theme_dict: dict = None, parent=None):
+    def __init__(self, cwd="", theme_dict=None, parent=None, command=None):
         super().__init__(parent)
         self.cwd = cwd or os.getcwd()
         self.theme = theme_dict or get_theme(settings.get_theme())
         self.master_fd = None
-        self.slave_fd = None
         self.pid = None
+        self._process = None
         self.notifier = None
-        self._last_rendered_content = ""
-
-        # pyte virtual terminal screen & stream
-        self.screen = TerminalScreen(80, 24, history=1000)
+        self._write_notifier = None
+        self._pending_write = bytearray()
+        self._rows = []
+        self._history_dropped = 0
+        self._visible_rows = {}
+        self._render_count = 0
+        self._closed = False
+        self.command = command
+        self.screen = TerminalScreen()
         self.stream = pyte.ByteStream(self.screen)
-
-        self._init_editor_ui()
+        self.screen.write_process_input = self.write_to_pty
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(33)
+        self._render_timer.timeout.connect(self._render_screen)
+        self._reap_timer = QTimer(self)
+        self._reap_timer.setInterval(250)
+        self._reap_timer.timeout.connect(self._check_child)
+        self.setReadOnly(True)
+        self.setUndoRedoEnabled(False)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.document().setDocumentMargin(8)
+        self.highlighter = TerminalHighlighter(self)
+        self.apply_theme(
+            self.theme, QFont(settings.get_font_family(), settings.get_font_size())
+        )
         self._spawn_pty()
 
-    def _init_editor_ui(self):
-        font_family = settings.get_font_family()
-        font_size = settings.get_font_size()
-        font = QFont(font_family, font_size)
-        font.setFixedPitch(True)
-        self.setFont(font)
-
-        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.setMaximumBlockCount(3000)
-
-        bg = self.theme.get("terminal_bg", "#1E1F22")
-        fg = self.theme.get("terminal_fg", "#E4E4E7")
-        sel = self.theme.get("editor_selection", "#2E436E")
-
-        self.setStyleSheet(f"""
-            QPlainTextEdit {{
-                background-color: {bg};
-                color: {fg};
-                selection-background-color: {sel};
-                selection-color: {fg};
-                border: none;
-                font-family: monospace;
-            }}
-        """)
-
-        self.highlighter = TerminalHighlighter(self.theme, self.document())
-
-    def apply_theme(self, theme_dict: dict, font: QFont = None):
-        """Applies theme colors and font dynamically."""
+    def apply_theme(self, theme_dict, font=None):
         self.theme = theme_dict
         if font:
             self.setFont(font)
-
-        bg = self.theme.get("terminal_bg", "#1E1F22")
-        fg = self.theme.get("terminal_fg", "#E4E4E7")
-        sel = self.theme.get("editor_selection", "#2E436E")
-
         self.setStyleSheet(f"""
-            QPlainTextEdit {{
-                background-color: {bg};
-                color: {fg};
-                selection-background-color: {sel};
-                selection-color: {fg};
-                border: none;
-                font-family: monospace;
-            }}
+            QPlainTextEdit {{ background: {self.theme["terminal_bg"]}; color: {self.theme["terminal_fg"]};
+                selection-background-color: {self.theme["editor_selection"]}; border: none; padding: 0; }}
         """)
-        self.highlighter.update_theme(theme_dict)
+        self.highlighter._formats.clear()
+        self.highlighter.rehighlight()
+        self._sync_size()
 
     def _spawn_pty(self):
-        """Forks child process attached to pseudo-terminal running the user's shell."""
-        self.master_fd, self.slave_fd = pty.openpty()
-
-        # Initial default window size
-        try:
-            winsize = struct.pack("HHHH", 24, 80, 0, 0)
-            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
-        except Exception:
-            pass
-
-        # Environment configuration
+        master, slave = pty_open()
         env = dict(os.environ)
-        env["TERM"] = "xterm-256color"
-        env["COLORTERM"] = "truecolor"
-        env["PROMPT_EOL_MARK"] = ""  # Disables Zsh inverse % symbol
-        env["LANG"] = os.environ.get("LANG", "en_US.UTF-8")
-
-        # Automatically bind .venv if present
-        venv_path = os.path.join(self.cwd, ".venv")
-        if os.path.isdir(venv_path):
-            env["VIRTUAL_ENV"] = venv_path
-            env["PATH"] = f"{os.path.join(venv_path, 'bin')}:{env.get('PATH', '')}"
-
-        # Ensure cargo/rust binaries are accessible
-        cargo_bin = os.path.expanduser("~/.cargo/bin")
-        if os.path.isdir(cargo_bin) and cargo_bin not in env.get("PATH", "").split(os.pathsep):
-            env["PATH"] = f"{cargo_bin}:{env.get('PATH', '')}"
-
+        env.update(TERM="xterm-256color", COLORTERM="truecolor")
+        venv = os.path.join(self.cwd, ".venv")
+        if os.path.isdir(venv):
+            env["VIRTUAL_ENV"] = venv
+            env["PATH"] = f"{venv}/bin:{env.get('PATH', '')}"
         shell = os.environ.get("SHELL", "/bin/bash")
-        if not os.path.exists(shell):
+        if not os.path.isfile(shell):
             shell = "/bin/bash"
-
-        self.pid = os.fork()
-        if self.pid == 0:
-            # Child process
-            os.close(self.master_fd)
-            os.setsid()
-            try:
-                fcntl.ioctl(self.slave_fd, termios.TIOCSCTTY, 0)
-            except Exception:
-                pass
-
-            os.dup2(self.slave_fd, 0)
-            os.dup2(self.slave_fd, 1)
-            os.dup2(self.slave_fd, 2)
-            os.close(self.slave_fd)
-
-            try:
-                os.chdir(self.cwd)
-            except Exception:
-                pass
-
-            os.execvpe(shell, [shell, "-i"], env)
-        else:
-            # Parent process
-            os.close(self.slave_fd)
-            self.slave_fd = None
-
-            self.notifier = QSocketNotifier(self.master_fd, QSocketNotifier.Type.Read, self)
-            self.notifier.activated.connect(self._read_from_pty)
+        argv = self.command or [shell, "-i"]
+        helper = Path(__file__).resolve().parents[1] / "core" / "pty_process.py"
+        try:
+            fcntl.ioctl(
+                slave,
+                termios.TIOCSWINSZ,
+                struct.pack("HHHH", self.screen.lines, self.screen.columns, 0, 0),
+            )
+            # No Python code runs after fork in the multithreaded Qt parent.
+            self._process = subprocess.Popen(
+                [sys.executable, "-I", "-S", str(helper), *argv],
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                cwd=self.cwd,
+                env=env,
+                start_new_session=True,
+                close_fds=True,
+            )
+            self.pid = self._process.pid
+        except OSError:
+            os.close(master)
+            raise
+        finally:
+            os.close(slave)
+        self.master_fd = master
+        os.set_blocking(master, False)
+        self.notifier = QSocketNotifier(master, QSocketNotifier.Type.Read, self)
+        self.notifier.activated.connect(self._read_from_pty)
+        self._write_notifier = QSocketNotifier(master, QSocketNotifier.Type.Write, self)
+        self._write_notifier.setEnabled(False)
+        self._write_notifier.activated.connect(self._flush_write)
+        self._sync_size()
+        self._reap_timer.start()
 
     def _read_from_pty(self):
-        """Reads output bytes from master PTY, cleans OSC/keypad noise, and feeds pyte."""
         if self.master_fd is None:
             return
-
         try:
-            raw_bytes = os.read(self.master_fd, 8192)
-            if not raw_bytes:
-                return
-
-            # Clean OSC window title sequences (\x1b]0;...\x07)
-            data = OSC_REGEX.sub(b"", raw_bytes)
-            # Clean VT100 keypad mode characters (\x1b= and \x1b>)
-            data = KEYPAD_REGEX.sub(b"", data)
-
+            # Bound parser work per event so keyboard and paint events get a turn.
+            data = os.read(self.master_fd, 16384)
+        except BlockingIOError:
+            return
+        except OSError as error:
+            if error.errno != errno.EIO:
+                self.setToolTip(f"Error de terminal: {error}")
+            data = b""
+        if data:
+            # ByteStream retains split UTF-8 and escape sequences across reads.
             self.stream.feed(data)
+            if not self._render_timer.isActive():
+                self._render_timer.start()
+        else:
+            self._disconnect_pty()
             self._render_screen()
-        except OSError:
-            if self.notifier:
-                self.notifier.setEnabled(False)
 
     def _render_screen(self):
-        """Renders pyte screen display buffer into QPlainTextEdit and updates cursor position."""
-        visible = [line.rstrip() for line in self.screen.display]
-        while visible and not visible[-1]:
+        self._render_timer.stop()
+        for line in range(self.screen.lines):
+            if line in self.screen.dirty or line not in self._visible_rows:
+                self._visible_rows[line] = snapshot(
+                    self.screen.buffer[line], self.screen.columns
+                )
+        self.screen.dirty.clear()
+        visible = [self._visible_rows[line] for line in range(self.screen.lines)]
+        while len(visible) > self.screen.cursor.y + 1 and not visible[-1].text:
             visible.pop()
-
-        all_lines = self.screen.history_lines + visible
-        content = "\n".join(all_lines)
-
-        if content != self._last_rendered_content:
-            sb = self.verticalScrollBar()
-            was_at_bottom = (sb.value() >= sb.maximum() - 4)
-
-            self.setPlainText(content)
-            self._last_rendered_content = content
-
-            # Move cursor to pyte screen cursor position
-            block_idx = len(self.screen.history_lines) + self.screen.cursor.y
-            doc = self.document()
-            block = doc.findBlockByNumber(block_idx)
+        rows = list(self.screen.history_rows) + visible
+        old = self._rows
+        scrollbar = self.verticalScrollBar()
+        follow = (
+            scrollbar.value() >= scrollbar.maximum() - 2
+            and not self.textCursor().hasSelection()
+        )
+        dropped = self.screen.history_dropped - self._history_dropped
+        self._history_dropped = self.screen.history_dropped
+        scroll_value = max(0, scrollbar.value() - dropped)
+        selection = self.textCursor()
+        self._rows = rows
+        if dropped and old:
+            count = min(dropped, len(old))
+            cursor = QTextCursor(self.document())
+            block = self.document().findBlockByNumber(count)
             if block.isValid():
-                cur = QTextCursor(block)
-                col = min(self.screen.cursor.x, max(0, block.length() - 1))
-                cur.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.MoveAnchor, col)
-                self.setTextCursor(cur)
+                cursor.setPosition(block.position(), QTextCursor.MoveMode.KeepAnchor)
+                cursor.removeSelectedText()
+            else:
+                self.document().clear()
+            old = old[count:]
+        prefix = 0
+        while prefix < min(len(old), len(rows)) and old[prefix] == rows[prefix]:
+            prefix += 1
+        if prefix < max(len(old), len(rows)):
+            # Replace only the changed suffix. Normal typing touches one block,
+            # leaving scrollback, undo allocation and unchanged layout alone.
+            cursor = QTextCursor(self.document())
+            block = self.document().findBlockByNumber(prefix)
+            if block.isValid():
+                cursor.setPosition(block.position())
+            else:
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.movePosition(
+                QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor
+            )
+            replacement = "\n".join(row.text for row in rows[prefix:])
+            if prefix >= len(old) and prefix > 0:
+                replacement = "\n" + replacement
+            cursor.insertText(replacement)
+            self._render_count += 1
+        if follow:
+            block = self.document().findBlockByNumber(
+                len(self.screen.history_rows) + self.screen.cursor.y
+            )
+            if block.isValid():
+                cursor = QTextCursor(block)
+                row = self.screen.buffer[self.screen.cursor.y]
+                text = "".join(
+                    row[col].data
+                    for col in range(min(self.screen.cursor.x, self.screen.columns))
+                )
+                column = min(len(text.encode("utf-16-le")) // 2, block.length() - 1)
+                cursor.setPosition(block.position() + column)
+                self.setTextCursor(cursor)
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            if selection.hasSelection():
+                self.setTextCursor(selection)
+            scrollbar.setValue(scroll_value)
 
-            if was_at_bottom:
-                self.ensureCursorVisible()
+    def write_to_pty(self, text):
+        if self.master_fd is None:
+            return
+        self._pending_write.extend(
+            text.encode("utf-8") if isinstance(text, str) else text
+        )
+        self._flush_write()
 
-    def write_to_pty(self, text: str):
-        """Sends command string directly to PTY master descriptor."""
-        if self.master_fd is not None:
-            try:
-                os.write(self.master_fd, text.encode("utf-8"))
-            except Exception:
-                pass
+    def _flush_write(self):
+        if self.master_fd is None:
+            return
+        try:
+            count = (
+                os.write(self.master_fd, self._pending_write)
+                if self._pending_write
+                else 0
+            )
+            del self._pending_write[:count]
+        except BlockingIOError:
+            pass
+        except OSError:
+            self._pending_write.clear()
+        self._write_notifier.setEnabled(bool(self._pending_write))
+
+    def paste(self):
+        text = QApplication.clipboard().text()
+        if text:
+            if 2004 << 5 in self.screen.mode:
+                text = "\x1b[200~" + text + "\x1b[201~"
+            self.write_to_pty(text)
+
+    def insertFromMimeData(self, source):
+        self.write_to_pty(source.text())
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        copy = menu.addAction("Copiar", self.copy)
+        copy.setEnabled(self.textCursor().hasSelection())
+        menu.addAction("Pegar", self.paste)
+        menu.exec(event.globalPos())
 
     def send_sigint(self):
-        """Sends Ctrl+C (SIGINT)."""
-        if self.pid:
-            try:
-                os.kill(self.pid, signal.SIGINT)
-            except Exception:
-                pass
-        if self.master_fd is not None:
-            try:
-                os.write(self.master_fd, b"\x03")
-            except Exception:
-                pass
+        # The terminal driver targets the foreground job, including its children.
+        self.write_to_pty(b"\x03")
 
-    def keyPressEvent(self, event: QKeyEvent):
-        """
-        Translates keyboard events to PTY bytes.
-        Never calls super().keyPressEvent(event) for typing keys to prevent duplicate local echo.
-        """
-        if self.master_fd is None:
-            return
-
-        key = event.key()
-        modifiers = event.modifiers()
+    def keyPressEvent(self, event):
+        key, modifiers = event.key(), event.modifiers()
         ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
         shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        alt = bool(modifiers & Qt.KeyboardModifier.AltModifier)
+        if ctrl and shift and key in (Qt.Key.Key_C, Qt.Key.Key_V):
+            self.copy() if key == Qt.Key.Key_C else self.paste()
+        elif shift and key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+            scrollbar = self.verticalScrollBar()
+            direction = -1 if key == Qt.Key.Key_PageUp else 1
+            scrollbar.setValue(scrollbar.value() + direction * scrollbar.pageStep())
+        elif ctrl and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+            self.write_to_pty(bytes([key - Qt.Key.Key_A + 1]))
+        else:
+            keys = {
+                Qt.Key.Key_Return: b"\r",
+                Qt.Key.Key_Enter: b"\r",
+                Qt.Key.Key_Backspace: b"\x7f",
+                Qt.Key.Key_Delete: b"\x1b[3~",
+                Qt.Key.Key_Tab: b"\t",
+                Qt.Key.Key_Backtab: b"\x1b[Z",
+                Qt.Key.Key_Up: b"\x1b[A",
+                Qt.Key.Key_Down: b"\x1b[B",
+                Qt.Key.Key_Right: b"\x1b[C",
+                Qt.Key.Key_Left: b"\x1b[D",
+                Qt.Key.Key_Home: b"\x1b[H",
+                Qt.Key.Key_End: b"\x1b[F",
+                Qt.Key.Key_PageUp: b"\x1b[5~",
+                Qt.Key.Key_PageDown: b"\x1b[6~",
+                Qt.Key.Key_Escape: b"\x1b",
+            }
+            data = keys.get(key, event.text().encode("utf-8"))
+            if alt and data:
+                data = b"\x1b" + data
+            self.write_to_pty(data)
+        event.accept()
 
-        # 1. Clipboard shortcuts
-        if ctrl and shift and key == Qt.Key.Key_C:
-            self.copy()
-            event.accept()
-            return
-
-        if ctrl and shift and key == Qt.Key.Key_V:
-            cb_text = QApplication.clipboard().text()
-            if cb_text:
-                try:
-                    os.write(self.master_fd, cb_text.encode("utf-8"))
-                except Exception:
-                    pass
-            event.accept()
-            return
-
-        # 2. Control key combinations
-        if ctrl:
-            if key == Qt.Key.Key_C:
-                self.send_sigint()
-                event.accept()
-                return
-            elif key == Qt.Key.Key_L:
-                try:
-                    os.write(self.master_fd, b"\x0c")
-                except Exception:
-                    pass
-                event.accept()
-                return
-            elif key == Qt.Key.Key_D:
-                try:
-                    os.write(self.master_fd, b"\x04")
-                except Exception:
-                    pass
-                event.accept()
-                return
-            elif key == Qt.Key.Key_Z:
-                try:
-                    os.write(self.master_fd, b"\x1a")
-                except Exception:
-                    pass
-                event.accept()
-                return
-            elif key == Qt.Key.Key_A:
-                try:
-                    os.write(self.master_fd, b"\x01")
-                except Exception:
-                    pass
-                event.accept()
-                return
-            elif key == Qt.Key.Key_E:
-                try:
-                    os.write(self.master_fd, b"\x05")
-                except Exception:
-                    pass
-                event.accept()
-                return
-            elif key == Qt.Key.Key_U:
-                try:
-                    os.write(self.master_fd, b"\x15")
-                except Exception:
-                    pass
-                event.accept()
-                return
-            elif key == Qt.Key.Key_K:
-                try:
-                    os.write(self.master_fd, b"\x0b")
-                except Exception:
-                    pass
-                event.accept()
-                return
-            elif key == Qt.Key.Key_W:
-                try:
-                    os.write(self.master_fd, b"\x17")
-                except Exception:
-                    pass
-                event.accept()
-                return
-            elif key == Qt.Key.Key_R:
-                try:
-                    os.write(self.master_fd, b"\x12")
-                except Exception:
-                    pass
-                event.accept()
-                return
-
-        # 3. Special navigation & editing keys
-        key_map = {
-            Qt.Key.Key_Return: b"\r",
-            Qt.Key.Key_Enter: b"\r",
-            Qt.Key.Key_Backspace: b"\x7f",
-            Qt.Key.Key_Delete: b"\x1b[3~",
-            Qt.Key.Key_Tab: b"\t",
-            Qt.Key.Key_Up: b"\x1b[A",
-            Qt.Key.Key_Down: b"\x1b[B",
-            Qt.Key.Key_Right: b"\x1b[C",
-            Qt.Key.Key_Left: b"\x1b[D",
-            Qt.Key.Key_Home: b"\x1b[H",
-            Qt.Key.Key_End: b"\x1b[F",
-            Qt.Key.Key_PageUp: b"\x1b[5~",
-            Qt.Key.Key_PageDown: b"\x1b[6~",
-            Qt.Key.Key_Escape: b"\x1b",
-        }
-
-        if key in key_map:
-            try:
-                os.write(self.master_fd, key_map[key])
-            except Exception:
-                pass
-            event.accept()
-            return
-
-        # 4. Standard printable character input
-        text = event.text()
-        if text:
-            try:
-                os.write(self.master_fd, text.encode("utf-8"))
-            except Exception:
-                pass
-            event.accept()
-            return
-
-    def resizeEvent(self, event):
-        """Synchronizes pyte screen dimensions and kernel TIOCSWINSZ window rows/cols."""
-        super().resizeEvent(event)
-        if self.master_fd is None:
-            return
-
-        font_metrics = self.fontMetrics()
-        char_w = max(1, font_metrics.horizontalAdvance("W"))
-        char_h = max(1, font_metrics.height())
-
-        cols = max(20, self.viewport().width() // char_w)
-        lines = max(5, self.viewport().height() // char_h)
-
-        if self.screen.columns != cols or self.screen.lines != lines:
+    def _sync_size(self):
+        metrics = self.fontMetrics()
+        cols = max(
+            20, (self.viewport().width() - 16) // max(1, metrics.horizontalAdvance("M"))
+        )
+        lines = max(3, (self.viewport().height() - 16) // max(1, metrics.lineSpacing()))
+        if (self.screen.lines, self.screen.columns) != (lines, cols):
             self.screen.resize(lines, cols)
-
-        try:
-            winsize = struct.pack("HHHH", lines, cols, 0, 0)
-            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
-        except Exception:
-            pass
-
-    def close(self):
-        """Clean termination of PTY and child shell process."""
-        if self.notifier:
-            self.notifier.setEnabled(False)
-            self.notifier = None
-
-        if self.pid:
-            try:
-                os.kill(self.pid, signal.SIGTERM)
-            except Exception:
-                pass
-            self.pid = None
-
+            self._visible_rows.clear()
+            self._render_timer.start()
         if self.master_fd is not None:
             try:
-                os.close(self.master_fd)
-            except Exception:
+                fcntl.ioctl(
+                    self.master_fd,
+                    termios.TIOCSWINSZ,
+                    struct.pack("HHHH", lines, cols, 0, 0),
+                )
+            except OSError:
                 pass
-            self.master_fd = None
 
-        super().close()
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_size()
+
+    def _check_child(self):
+        if not self.pid:
+            return
+        code = self._process.poll()
+        if code is not None:
+            self.pid = None
+            self._reap_timer.stop()
+            self.session_finished.emit(code)
+
+    def _disconnect_pty(self):
+        for notifier in (self.notifier, self._write_notifier):
+            if notifier:
+                notifier.setEnabled(False)
+                notifier.deleteLater()
+        self.notifier = self._write_notifier = None
+        if self.master_fd is not None:
+            os.close(self.master_fd)
+            self.master_fd = None
+        self._pending_write.clear()
+
+    def closeEvent(self, event):
+        if not self._closed:
+            self._closed = True
+            self._render_timer.stop()
+            groups = set()
+            if self.master_fd is not None:
+                try:
+                    groups.add(os.tcgetpgrp(self.master_fd))
+                except OSError:
+                    pass
+            if self.pid:
+                groups.add(self.pid)
+            for group in groups:
+                if group > 0 and group != os.getpgrp():
+                    try:
+                        os.killpg(group, signal.SIGHUP)
+                        os.killpg(group, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            self._disconnect_pty()
+            self._check_child()
+            # Reap asynchronously if the kernel has not delivered child exit yet.
+        super().closeEvent(event)
+
+
+def pty_open():
+    import pty
+
+    return pty.openpty()
 
 
 class TerminalPanel(QWidget):
-    """Multi-tabbed terminal panel with quick launches and Mint external terminal integration."""
-
     collapse_requested = pyqtSignal()
 
-    def __init__(self, project_dir: str = "", theme_dict: dict = None, parent=None):
+    def __init__(self, project_dir="", theme_dict=None, parent=None):
         super().__init__(parent)
         self.project_dir = project_dir or os.getcwd()
         self.theme = theme_dict or get_theme(settings.get_theme())
-
-        self._init_ui()
-        self.new_terminal_tab("Terminal 1")
-
-    def _init_ui(self):
+        self._run_terminal = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-
-        # Header toolbar inside Terminal island
-        self.header = QWidget()
-        self.header.setObjectName("islandHeader")
-        h_layout = QHBoxLayout(self.header)
-        h_layout.setContentsMargins(8, 4, 8, 4)
-        h_layout.setSpacing(6)
-
+        header = QWidget()
+        header.setObjectName("islandHeader")
+        bar = QHBoxLayout(header)
+        bar.setContentsMargins(12, 3, 8, 3)
         title = QLabel("TERMINAL")
         title.setObjectName("islandHeaderTitle")
-        h_layout.addWidget(title)
-
-        h_layout.addSpacing(6)
-
-        # FastAPI button
-        btn_fastapi = QPushButton("▶ FastAPI")
-        btn_fastapi.setToolTip("uv run uvicorn main:app --reload")
-        btn_fastapi.clicked.connect(self.run_fastapi)
-        h_layout.addWidget(btn_fastapi)
-
-        # Django button
-        btn_django = QPushButton("▶ Django")
-        btn_django.setToolTip("uv run python manage.py runserver")
-        btn_django.clicked.connect(self.run_django)
-        h_layout.addWidget(btn_django)
-
-        # Stop button
-        btn_stop = QPushButton("⏹ Stop")
-        btn_stop.setToolTip("Send SIGINT (Ctrl+C) to current terminal")
-        btn_stop.clicked.connect(self.stop_current_process)
-        h_layout.addWidget(btn_stop)
-
-        h_layout.addStretch()
-
-        # Native Linux Mint Terminal button [↗ Terminal Nativa Mint]
-        btn_native = QPushButton("↗ Terminal Nativa Mint")
-        btn_native.setToolTip("Abrir en la terminal nativa del sistema (gnome-terminal)")
-        btn_native.clicked.connect(self.open_native_terminal)
-        h_layout.addWidget(btn_native)
-
-        # New tab button [+]
-        btn_new_tab = QPushButton("+")
-        btn_new_tab.setObjectName("islandHeaderBtn")
-        btn_new_tab.setToolTip("Nueva pestaña de terminal")
-        btn_new_tab.setFixedSize(22, 22)
-        btn_new_tab.clicked.connect(lambda: self.new_terminal_tab())
-        h_layout.addWidget(btn_new_tab)
-
-        # Collapse button [—]
-        btn_collapse = QPushButton("—")
-        btn_collapse.setObjectName("islandHeaderBtn")
-        btn_collapse.setToolTip("Ocultar terminal (Ctrl+J)")
-        btn_collapse.setFixedSize(22, 22)
-        btn_collapse.clicked.connect(self.collapse_requested.emit)
-        h_layout.addWidget(btn_collapse)
-
-        layout.addWidget(self.header)
-
-        # Tabs container
+        bar.addWidget(title)
+        self.lbl_run_status = QLabel("")
+        self.lbl_run_status.setObjectName("mutedLabel")
+        bar.addWidget(self.lbl_run_status)
+        bar.addStretch()
+        self.btn_stop = QPushButton("■")
+        self.btn_stop.setToolTip("Interrumpir ejecución o terminal activa (Shift+F5)")
+        self.btn_stop.clicked.connect(self.stop_current_process)
+        bar.addWidget(self.btn_stop)
+        for text, tooltip, callback in (
+            ("+", "Nueva terminal", lambda: self.new_terminal_tab()),
+            ("↗", "Abrir terminal del sistema", self.open_native_terminal),
+            ("−", "Ocultar terminal (Ctrl+J)", self.collapse_requested.emit),
+        ):
+            button = QPushButton(text)
+            button.setObjectName("islandHeaderBtn")
+            button.setFixedSize(26, 24)
+            button.setToolTip(tooltip)
+            button.clicked.connect(callback)
+            bar.addWidget(button)
+        layout.addWidget(header)
         self.tabs = QTabWidget()
-        self.tabs.setTabsClosable(True)
         self.tabs.setDocumentMode(True)
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
         layout.addWidget(self.tabs)
+        self.new_terminal_tab()
 
-    def set_project_dir(self, path: str):
+    def set_project_dir(self, path):
+        # Existing sessions keep their working directory; new sessions use this project.
         self.project_dir = path
 
-    def new_terminal_tab(self, name: str = None) -> PTYTerminalWidget:
-        """Spawns a new terminal tab in current project directory."""
-        tab_name = name or f"Terminal {self.tabs.count() + 1}"
-        term = PTYTerminalWidget(cwd=self.project_dir, theme_dict=self.theme, parent=self)
-        idx = self.tabs.addTab(term, tab_name)
-        self.tabs.setCurrentIndex(idx)
+    def new_terminal_tab(self, name=None, cwd=None):
+        term = PTYTerminalWidget(cwd or self.project_dir, self.theme, self)
+        index = self.tabs.addTab(term, name or f"Terminal {self.tabs.count() + 1}")
+        term.session_finished.connect(
+            lambda code, widget=term: self._session_finished(widget, code)
+        )
+        self.tabs.setCurrentIndex(index)
         term.setFocus()
         return term
 
-    def current_terminal(self) -> PTYTerminalWidget:
-        widget = self.tabs.currentWidget()
-        return widget if isinstance(widget, PTYTerminalWidget) else None
+    def _session_finished(self, term, code):
+        index = self.tabs.indexOf(term)
+        if index >= 0:
+            self.tabs.setTabText(
+                index, f"{'Ejecución' if term.command else 'Terminal'} · {code}"
+            )
+        if term is self._run_terminal:
+            self.lbl_run_status.setText(f"Finalizó · código {code}")
 
-    def close_tab(self, index: int):
-        if self.tabs.count() <= 1:
-            term = self.tabs.widget(index)
-            if isinstance(term, PTYTerminalWidget):
-                term.close()
-            self.tabs.removeTab(index)
-            self.new_terminal_tab("Terminal 1")
-            return
+    def run_is_active(self):
+        return self._run_terminal is not None and self._run_terminal.pid is not None
 
-        term = self.tabs.widget(index)
-        if isinstance(term, PTYTerminalWidget):
-            term.close()
-        self.tabs.removeTab(index)
-
-    def send_command_to_terminal(self, cmd: str):
-        """Sends a command to the active terminal tab, ensuring it runs interactively with enter."""
-        term = self.current_terminal() or self.new_terminal_tab()
+    def run_command(self, argv, cwd, name):
+        if self.run_is_active():
+            return False
+        if self._run_terminal is not None:
+            index = self.tabs.indexOf(self._run_terminal)
+            self._run_terminal.close()
+            self._run_terminal.deleteLater()
+            if index >= 0:
+                self.tabs.removeTab(index)
+        term = PTYTerminalWidget(cwd, self.theme, self, command=argv)
+        self._run_terminal = term
+        index = self.tabs.addTab(term, name)
+        self.tabs.setTabToolTip(index, shlex.join(argv))
+        self.tabs.setCurrentIndex(index)
+        term.session_finished.connect(lambda code: self._session_finished(term, code))
+        self.lbl_run_status.setText("En ejecución")
         term.setFocus()
-        clean_cmd = cmd.rstrip("\r\n")
-        term.write_to_pty(f"{clean_cmd}\r")
+        return True
 
-    def run_fastapi(self):
-        term = self.current_terminal() or self.new_terminal_tab("FastAPI")
-        term.write_to_pty("uv run uvicorn main:app --reload\n")
+    def current_terminal(self):
+        return self.tabs.currentWidget()
 
-    def run_django(self):
-        term = self.current_terminal() or self.new_terminal_tab("Django")
-        term.write_to_pty("uv run python manage.py runserver\n")
+    def close_tab(self, index):
+        term = self.tabs.widget(index)
+        if term is None:
+            return
+        if term is self._run_terminal:
+            self._run_terminal = None
+            self.lbl_run_status.clear()
+        term.close()
+        self.tabs.removeTab(index)
+        # Keep the object until waitpid has reaped its shell.
+        if term.pid:
+            term.session_finished.connect(lambda _: term.deleteLater())
+        else:
+            term.deleteLater()
+        if not self.tabs.count():
+            self.new_terminal_tab()
+
+    def send_command_to_terminal(self, cmd):
+        term = self.current_terminal()
+        if term is None or term.command or term.pid is None:
+            term = self.new_terminal_tab()
+        term.setFocus()
+        term.write_to_pty(cmd.rstrip("\r\n") + "\r")
 
     def stop_current_process(self):
-        term = self.current_terminal()
+        term = self._run_terminal if self.run_is_active() else self.current_terminal()
         if term:
             term.send_sigint()
 
     def open_native_terminal(self):
-        """Launches native Linux Mint terminal (gnome-terminal, x-terminal-emulator) in project directory."""
-        target_dir = self.project_dir or os.getcwd()
-        for term_bin in ["gnome-terminal", "x-terminal-emulator", "xfce4-terminal", "xterm"]:
-            if shutil.which(term_bin):
-                if term_bin in ("gnome-terminal", "xfce4-terminal"):
-                    QProcess.startDetached(term_bin, [f"--working-directory={target_dir}"])
-                else:
-                    QProcess.startDetached(term_bin, [], target_dir)
+        for binary in (
+            "gnome-terminal",
+            "x-terminal-emulator",
+            "xfce4-terminal",
+            "xterm",
+        ):
+            if shutil.which(binary):
+                args = (
+                    [f"--working-directory={self.project_dir}"]
+                    if binary in ("gnome-terminal", "xfce4-terminal")
+                    else []
+                )
+                QProcess.startDetached(binary, args, self.project_dir)
                 return
 
-    def apply_theme(self, theme_dict: dict, font: QFont = None):
-        """Updates theme for all terminal tabs."""
+    def apply_theme(self, theme_dict, font=None):
         self.theme = theme_dict
-        for i in range(self.tabs.count()):
-            widget = self.tabs.widget(i)
-            if isinstance(widget, PTYTerminalWidget):
-                widget.apply_theme(theme_dict, font)
+        for index in range(self.tabs.count()):
+            self.tabs.widget(index).apply_theme(theme_dict, font)

@@ -86,7 +86,7 @@ class SettingsManager:
         self._settings = QSettings(APP_ORG, "PyMintIDE")
 
     def get_theme(self) -> str:
-        return str(self._settings.value("theme", "JetBrains Air Dark"))
+        return str(self._settings.value("theme", "Graphite"))
 
     def set_theme(self, theme_name: str):
         self._settings.setValue("theme", theme_name)

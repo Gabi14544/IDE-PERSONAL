@@ -7,13 +7,10 @@ saving, and lint/formatting integration with dynamic theme switching.
 import os
 from PyQt6.QtWidgets import (
     QTabWidget,
-    QWidget,
-    QVBoxLayout,
     QMessageBox,
-    QLabel,
 )
 from PyQt6.QtCore import pyqtSignal, Qt
-from PyQt6.QtGui import QIcon, QFont
+from PyQt6.QtGui import QFont
 
 from ui.code_editor import CodeEditor
 from core.linter_runner import LinterRunner
@@ -49,48 +46,30 @@ class EditorTabs(QTabWidget):
 
         self._apply_tab_style()
 
+    def confirm_close(self):
+        """Offer to save modified files before the window shuts down."""
+        for filepath, editor in self._editors.items():
+            if not editor.isModified():
+                continue
+            answer = QMessageBox.question(
+                self, "Cambios sin guardar", f"¿Guardar los cambios de {os.path.basename(filepath)}?",
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save,
+            )
+            if answer == QMessageBox.StandardButton.Cancel:
+                return False
+            if answer == QMessageBox.StandardButton.Save and not self.save_file(filepath):
+                return False
+        return True
+
     def close_all(self):
         """Cleanly terminates linter before closing."""
         self.linter.stop_all()
 
     def _apply_tab_style(self):
-        """Card-themed tab bar styling with rounded tab tops and clear active state."""
-        th = self.theme
-        card_bg = th["card_bg"]
-        card_border = th["card_border"]
-        header_bg = th["header_bg"]
-        text = th["text"]
-        text_muted = th["text_muted"]
-        accent = th["accent"]
-        surface = th["surface"]
-
-        self.setStyleSheet(f"""
-            QTabWidget::pane {{
-                border: none;
-                background: {card_bg};
-            }}
-            QTabBar::tab {{
-                background: {header_bg};
-                color: {text_muted};
-                padding: 6px 14px;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                border: 1px solid {card_border};
-                border-bottom: none;
-                margin-right: 2px;
-                font-size: 11px;
-            }}
-            QTabBar::tab:selected {{
-                background: {card_bg};
-                color: {accent};
-                border-top: 2px solid {accent};
-                font-weight: bold;
-            }}
-            QTabBar::tab:hover:!selected {{
-                background: {surface};
-                color: {text};
-            }}
-        """)
+        self.setStyleSheet("")  # The workspace stylesheet owns tab appearance.
+        self.setUsesScrollButtons(True)
+        self.setElideMode(Qt.TextElideMode.ElideMiddle)
 
     def apply_theme(self, theme_dict: dict, font: QFont = None):
         """Propagates theme and font to all open editors and updates tab styling."""
@@ -269,4 +248,6 @@ class EditorTabs(QTabWidget):
         self.removeTab(index)
         self._editors.pop(filepath, None)
         self._modified_states.pop(filepath, None)
+        widget._debounce_timer.stop()
+        widget.deleteLater()
         return True

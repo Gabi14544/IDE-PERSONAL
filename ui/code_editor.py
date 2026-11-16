@@ -6,8 +6,9 @@ debounced Jedi autocompletion, Ruff margin markers, and multi-language lexers.
 
 import os
 import re
+from itertools import count
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtWidgets import QListView, QToolTip
+from PyQt6.QtWidgets import QListView
 from PyQt6.QtGui import QColor, QFont, QKeyEvent
 from PyQt6.Qsci import (
     QsciScintilla,
@@ -50,6 +51,8 @@ class RustLexer(QsciLexerCPP):
             )
         return ""
 
+
+COMPLETION_IDS = count(1)
 
 RUST_AUTOCOMPLETE_KEYWORDS = [
     # Palabras clave, tipos, macros y métodos esenciales de Rust (0 MB extra RAM)
@@ -129,6 +132,7 @@ class CodeEditor(QsciScintilla):
         self._debounce_timer.setInterval(AUTOCOMPLETE_DEBOUNCE_MS)
         self._debounce_timer.timeout.connect(self._trigger_completion)
 
+        self.setFrameStyle(0)
         self._init_editor_settings()
         self._init_margins()
         self._init_lexer()
@@ -358,7 +362,7 @@ class CodeEditor(QsciScintilla):
 
     def _on_text_changed(self):
         """Debounce autocompletion request on text modification."""
-        if not (self.filepath.endswith(".py") or self.filepath.endswith(".rs")):
+        if not self.hasFocus() or not (self.filepath.endswith(".py") or self.filepath.endswith(".rs")):
             return
         self._debounce_timer.start()
 
@@ -428,7 +432,7 @@ class CodeEditor(QsciScintilla):
             self._trigger_rust_completion()
             return
 
-        if not self.lsp_worker or not self.filepath.endswith(".py"):
+        if not self.hasFocus() or not self.lsp_worker or not self.filepath.endswith(".py"):
             return
 
         line, col = self.getCursorPosition()
@@ -439,7 +443,7 @@ class CodeEditor(QsciScintilla):
         if not prefix and char_before != ".":
             return
 
-        self._current_req_id += 1
+        self._current_req_id = next(COMPLETION_IDS)
         project_dir = os.path.dirname(self.filepath) or os.getcwd()
         venv_python = settings.get_venv_python(project_dir)
 
@@ -465,7 +469,7 @@ class CodeEditor(QsciScintilla):
 
     def _on_signature_ready(self, req_id: int, sig_text: str):
         """Display function signature hint in status bar, strictly capped to 1 line and 90 chars."""
-        if req_id != self._current_req_id or not sig_text:
+        if not self.hasFocus() or req_id != self._current_req_id or not sig_text:
             return
         msg = f"Signature: {sig_text}"
         clean = " ".join(msg.splitlines()).strip()

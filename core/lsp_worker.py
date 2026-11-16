@@ -3,16 +3,10 @@ PyMint IDE - Jedi LSP Worker Thread
 Handles code completions and signature help in background without blocking Qt UI thread.
 """
 
-import sys
 import os
 import re
 from PyQt6.QtCore import QThread, pyqtSignal, QMutex, QWaitCondition
 
-try:
-    import jedi
-    JEDI_AVAILABLE = True
-except ImportError:
-    JEDI_AVAILABLE = False
 
 
 def format_universal_signature(sig) -> str:
@@ -70,17 +64,18 @@ class LSPWorker(QThread):
         self._last_project_dir = None
         self._last_python_path = None
         self._cached_project = None
+        self._jedi = None
 
     def request_completion(self, req_id: int, code: str, line: int, col: int, filepath: str, project_dir: str, python_path: str, prefix: str):
         """Submit a completion request (overwrites any pending unprocessed request)."""
-        if not JEDI_AVAILABLE:
-            return
         self._mutex.lock()
         self._pending_request = CompletionRequest(
             req_id, code, line, col, filepath, project_dir, python_path, prefix
         )
         self._cond.wakeOne()
         self._mutex.unlock()
+        if not self.isRunning():
+            self.start()
 
     def stop(self):
         """Safely terminates the worker thread."""
@@ -88,7 +83,7 @@ class LSPWorker(QThread):
         self._running = False
         self._cond.wakeOne()
         self._mutex.unlock()
-        self.wait(1000)
+        return self.wait(50)
 
     def _get_project(self, project_dir: str, python_path: str):
         if (self._cached_project and 
@@ -100,17 +95,23 @@ class LSPWorker(QThread):
         self._last_python_path = python_path
         try:
             if python_path and os.path.exists(python_path):
-                self._cached_project = jedi.Project(
+                self._cached_project = self._jedi.Project(
                     path=project_dir or os.getcwd(),
                     environment_path=python_path,
                 )
             else:
-                self._cached_project = jedi.Project(path=project_dir or os.getcwd())
+                self._cached_project = self._jedi.Project(path=project_dir or os.getcwd())
         except Exception:
             self._cached_project = None
         return self._cached_project
 
     def run(self):
+        # Import completion machinery only after the first request.
+        try:
+            import jedi
+        except ImportError:
+            return
+        self._jedi = jedi
         while True:
             self._mutex.lock()
             while self._running and self._pending_request is None:
@@ -129,7 +130,7 @@ class LSPWorker(QThread):
 
             try:
                 proj = self._get_project(req.project_dir, req.python_path)
-                script = jedi.Script(
+                script = self._jedi.Script(
                     code=req.code,
                     path=req.filepath or "untitled.py",
                     project=proj,

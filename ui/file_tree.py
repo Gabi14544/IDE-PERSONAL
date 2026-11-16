@@ -6,20 +6,17 @@ to strictly ignore heavy folders (.venv, __pycache__, node_modules, etc.)
 
 import os
 import shutil
-import subprocess
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
-    QHBoxLayout,
     QTreeView,
     QLabel,
-    QPushButton,
     QMenu,
     QInputDialog,
     QMessageBox,
     QApplication,
 )
-from PyQt6.QtGui import QFileSystemModel, QAction, QIcon
+from PyQt6.QtGui import QFileSystemModel
 from PyQt6.QtCore import Qt, QSortFilterProxyModel, pyqtSignal, QModelIndex
 
 from core.config import IGNORED_DIRS, IGNORED_EXTENSIONS, THEME
@@ -63,42 +60,14 @@ class FileTreePanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
 
-        # Header bar
-        header_widget = QWidget()
-        header_widget.setStyleSheet(f"background-color: {THEME['mantle']}; padding: 4px;")
-        header_layout = QHBoxLayout(header_widget)
-        header_layout.setContentsMargins(8, 4, 8, 4)
-        header_layout.setSpacing(4)
-
-        self.title_label = QLabel("EXPLORER")
-        self.title_label.setStyleSheet(
-            f"color: {THEME['subtext1']}; font-weight: bold; font-size: 11px; letter-spacing: 1px;"
-        )
-        header_layout.addWidget(self.title_label)
-        header_layout.addStretch()
-
-        self.refresh_btn = QPushButton("⟳")
-        self.refresh_btn.setToolTip("Refresh Explorer")
-        self.refresh_btn.setFixedSize(22, 22)
-        self.refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: transparent;
-                color: {THEME['text']};
-                border: none;
-                border-radius: 3px;
-                font-size: 14px;
-            }}
-            QPushButton:hover {{
-                background-color: {THEME['surface0']};
-            }}
-        """)
-        self.refresh_btn.clicked.connect(self.refresh)
-        header_layout.addWidget(self.refresh_btn)
-
-        layout.addWidget(header_widget)
+        self.title_label = QLabel()
+        self.title_label.setObjectName("mutedLabel")
+        self.title_label.setContentsMargins(12, 6, 4, 6)
+        layout.addWidget(self.title_label)
 
         # File system model + Proxy filter
-        self.fs_model = QFileSystemModel()
+        self.fs_model = QFileSystemModel(self)
+        self.fs_model.setOption(QFileSystemModel.Option.DontUseCustomDirectoryIcons, True)
         self.fs_model.setReadOnly(False)
 
         self.proxy_model = IgnoreFilterProxyModel(self)
@@ -112,6 +81,7 @@ class FileTreePanel(QWidget):
         for col in range(1, 4):
             self.tree_view.hideColumn(col)
 
+        self.tree_view.setUniformRowHeights(True)
         self.tree_view.setAnimated(False)  # Disabled animation for low-spec CPU performance
         self.tree_view.setIndentation(14)
         self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -163,7 +133,7 @@ class FileTreePanel(QWidget):
             return
         self.root_path = os.path.abspath(path)
         folder_name = os.path.basename(self.root_path) or self.root_path
-        self.title_label.setText(f"PROJECT: {folder_name.upper()}")
+        self.title_label.setText(folder_name)
 
         self.fs_model.setRootPath(self.root_path)
         source_index = self.fs_model.index(self.root_path)

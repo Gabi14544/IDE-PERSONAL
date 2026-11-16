@@ -1,81 +1,64 @@
-# PyMint IDE 🍃
+# PyMint IDE
 
-**PyMint IDE** es un entorno de desarrollo integrado (IDE) de escritorio nativo, profesional y ultraligero diseñado específicamente para desarrollo Backend en Python (FastAPI, Django, Docker, PostgreSQL y NoSQL) y optimizado al extremo para hardware de bajos recursos (ej. Intel Celeron / 4GB RAM) bajo Linux Mint Cinnamon.
+IDE nativo para Python y Rust en Linux. La interfaz usa PyQt6 y QScintilla; la terminal usa PTY y pyte. El diseño compacto está pensado para pantallas de 1366×768 y equipos como el Celeron N2808 con 4 GB de RAM y Linux Mint 22.3.
 
----
+## Interfaz y ejecución
 
-## 🚀 Características Clave
+- Tema **Graphite** con superficies neutras, acento azul, paneles ajustables y una pantalla inicial limpia. Los temas anteriores siguen disponibles en **Ajustes**, junto con la fuente y su tamaño.
+- Un único botón **Ejecutar** guarda el archivo activo y lo abre en una pestaña de ejecución independiente. Las terminales de trabajo conservan sus comandos y su directorio.
+- Python usa el intérprete de la `.venv` más cercana al archivo y salida sin búfer. También se pueden ejecutar scripts Bash, proyectos Cargo y archivos Rust sueltos. Rust requiere `cargo`/`rustc`; las compilaciones Cargo se limitan a un trabajo.
+- La pestaña de ejecución muestra el código de salida y se reutiliza en la siguiente ejecución. Si ya hay un programa activo, primero hay que detenerlo.
+- El cierre del IDE permite guardar, descartar o cancelar cuando quedan cambios pendientes.
 
-- **100% Nativo:** Desarrollado sobre `PyQt6` y `QScintilla` en C++. Cero Electron, Cero Chromium, Cero NodeJS.
-- **Consumo de Memoria Ultrabajo:** Menos de 85 MB de RAM en uso normal.
-- **Cero Bloqueo de UI (Non-blocking):** Todas las tareas pesadas (Jedi, Ruff, Git, UV, Terminal PTY) corren en hilos secundarios (`QThread`) o procesos asíncronos (`QProcess`).
-- **Editor QScintilla Inteligente:**
-  - Tema oscuro Catppuccin Mocha de bajo cansancio visual.
-  - Autocompletado con `Jedi` y *debounce* de 350 ms para no saturar la CPU Celeron.
-  - Detección y vinculación automática al `.venv` del proyecto.
-  - Resaltado nativo para Python, SQL (PostgreSQL), JSON, YAML, Bash, Dockerfile y Markdown.
-  - Linting y formateo instantáneo con `Ruff` (en Rust) al guardar (`Ctrl+S`) y (`Ctrl+Shift+F`).
-- **Terminal Profesional Linux Nativa:**
-  - Terminal multi-pestaña usando PTY (`pty.openpty`) y `QSocketNotifier`.
-  - Autoactivación de `.venv` en cada pestaña.
-  - Botones de lanzamiento rápido: `▶ Run FastAPI` y `▶ Run Django`.
-  - Botón de parada `⏹ Stop Server` con señal real `SIGINT (Ctrl+C)`.
-- **Panel Git & GitHub Visual:**
-  - Cambio y creación de ramas (`checkout -b`).
-  - Grafo ASCII de commits en vivo (`git log --graph`).
-  - Staging / Unstaging con un clic y visor de diffs.
-  - Botones de sincronización: `⬆ Push`, `⬇ Pull`, `🔄 Fetch`, `🔗 Clone`.
-- **Integración con `uv` (Astral):**
-  - Inicialización de proyecto y entorno en 1 clic.
-  - Instalador de paquetes (`uv add` / `uv remove`).
-  - Presets Backend: FastAPI, Django, PostgreSQL y NoSQL.
-- **Panel RAM Guard:**
-  - Monitor en tiempo real de RAM libre leyendo `/proc/meminfo` cada 3 segundos.
-  - Alerta visual si la memoria libre baja de 450 MB.
-  - Interruptores 1-clic para iniciar o detener `docker`, `postgresql`, `mongod` y `redis-server` (con polkit `pkexec` de Cinnamon).
-  - Control de contenedores Docker y `docker compose up -d` / `down`.
+## Terminal y rendimiento
 
----
+La terminal procesa entrada y salida sin bloquear, conserva las secuencias UTF-8 y ANSI entre lecturas y muestra colores, negrita, cursiva y subrayado. El historial está limitado a 2000 líneas por sesión. Las actualizaciones se agrupan cada 33 ms y solo se reemplaza el texto que cambió; el historial antiguo se elimina de forma incremental. La selección y la posición de lectura se mantienen mientras llega salida nueva.
 
-## 📂 Estructura del Proyecto
+Los procesos reciben el tamaño real de la terminal y `Ctrl+C` interrumpe el trabajo en primer plano. Los procesos terminados se recogen para evitar shells zombis. El menú contextual y `Ctrl+Shift+C` / `Ctrl+Shift+V` permiten copiar y pegar.
 
-```text
-pymint_ide/
-├── main.py                      # Punto de entrada y configuración de bajo consumo
-├── pyproject.toml               # Configuración de dependencias gestionada con uv
-├── install_desktop.sh           # Instalador de acceso directo en Linux Mint
-├── assets/
-│   └── pymint-icon.svg          # Ícono vectorial de PyMint IDE
-├── core/
-│   ├── config.py                # Rutas, paleta de colores y preferencias persistentes
-│   ├── lsp_worker.py            # Hilo secundario Jedi para autocompletado y firmas
-│   ├── linter_runner.py         # Ejecución asíncrona de Ruff (check & format)
-│   ├── uv_manager.py            # Controlador asíncrono de comandos uv
-│   ├── git_manager.py           # Controlador asíncrono de Git y GitHub
-│   └── service_guard.py         # Monitor /proc/meminfo y gestor de servicios
-└── ui/
-    ├── main_window.py           # Ventana principal con QSplitter acoplables
-    ├── file_tree.py             # Explorador filtrado sin indexación pesada
-    ├── editor_tabs.py           # Gestor de pestañas e indicador de modificado (*)
-    ├── code_editor.py           # Editor QsciScintilla con marcadores de Ruff
-    ├── terminal_panel.py        # Terminal Linux multi-pestaña PTY
-    ├── git_panel.py             # Panel visual de Git, ramas y GitHub
-    ├── uv_dialog.py             # Panel de gestión uv y presets Backend
-    └── service_panel.py         # Panel "RAM Guard" de servicios y Docker
+Jedi se carga en segundo plano al solicitar el primer autocompletado. El explorador evita iconos personalizados de carpetas y usa filas de altura uniforme. Git se consulta al abrir su panel y los servicios del sistema al abrir su menú; no se lanzan esas consultas al iniciar el IDE. La interfaz no usa animaciones ni efectos de composición.
+
+En una medición del entorno de desarrollo, 200 actualizaciones con historial lleno pasaron de **3,63 s a 0,37 s** frente a la implementación anterior. Es una medición del renderizado de terminal, no una promesa de aceleración de toda la aplicación ni una prueba en la notebook física. Se puede repetir con `tests/benchmark_terminal.py` usando el mismo intérprete para ambas versiones.
+
+## Instalación y arranque
+
+Requiere Linux y Python 3.10 o superior. En Linux Mint 22.3 se puede usar Python 3.12. Con [uv](https://docs.astral.sh/uv/):
+
+```bash
+cd IDE-PERSONAL
+uv venv .venv
+uv pip install --python .venv/bin/python -r pyproject.toml --extra wheels ruff uv
+source .venv/bin/activate
+python main.py /ruta/a/tu/proyecto
 ```
 
----
+La instalación lee las dependencias del manifiesto y ejecuta el proyecto desde su código fuente. No es necesario iniciar Docker, PostgreSQL, MongoDB o Redis para usar el IDE. El control opcional de servicios requiere systemd y polkit en el sistema local.
 
-## ⌨️ Atajos de Teclado
+## Atajos
 
-| Atajo | Acción |
-|---|---|
-| `Ctrl+S` | Guardar archivo actual y ejecutar linting Ruff |
-| `Ctrl+Shift+S` | Guardar todos los archivos abiertos |
-| `Ctrl+Shift+F` | Formatear archivo con Ruff |
-| `Ctrl+Espacio` | Disparar autocompletado inteligente Jedi |
-| `F11` | Alternar Pantalla Completa (Full Screen) |
-| `Ctrl+B` | Mostrar / Ocultar barra lateral |
-| `Ctrl+\`` | Mostrar / Ocultar panel de terminal |
-| `Ctrl+C` (en Terminal) | Enviar señal de interrupción SIGINT al proceso |
-| `Ctrl+L` (en Terminal) | Limpiar pantalla de terminal |
+| Acción | Atajo |
+| --- | --- |
+| Ejecutar archivo activo | F5 / Ctrl+R |
+| Detener ejecución | Shift+F5 |
+| Interrumpir trabajo en terminal | Ctrl+C |
+| Abrir carpeta | Ctrl+O |
+| Guardar / guardar todo | Ctrl+S / Ctrl+Shift+S |
+| Formatear con Ruff | Ctrl+Shift+F |
+| Autocompletado | Ctrl+Espacio |
+| Mostrar panel lateral | Ctrl+B |
+| Mostrar terminal | Ctrl+J / Ctrl+` |
+| Pantalla completa | F11 |
+| Copiar / pegar en terminal | Ctrl+Shift+C / Ctrl+Shift+V |
+| Desplazar historial de terminal | Shift+PageUp / Shift+PageDown |
+
+## Validación
+
+```bash
+source .venv/bin/activate
+QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests -v
+python tests/benchmark_terminal.py
+```
+
+Las pruebas funcionales cubren ejecución y guardado, rutas con caracteres especiales, selección del intérprete, bloqueo de ejecuciones simultáneas, cierre con cambios pendientes, tamaños de ventana reducidos, autocompletado Jedi y terminal real: entrada, salida abundante, colores ANSI, secuencias partidas, redimensionado, interrupción, historial y recogida de procesos.
+
+El modo `offscreen` permite validar sin un escritorio. La apariencia y el rendimiento final deben comprobarse también en el equipo físico. La terminal implementa el subconjunto VT soportado por pyte; no pretende sustituir todas las funciones de un emulador de terminal dedicado.

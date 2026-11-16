@@ -28,18 +28,20 @@ class GitManager(QObject):
         target = os.path.abspath(path) if path else os.getcwd()
         self.repo_dir = target
 
-        git_bin = settings.get_git_path()
-        proc = QProcess()
-        proc.setWorkingDirectory(target)
-        proc.start(git_bin, ["rev-parse", "--show-toplevel"])
-        if proc.waitForFinished(800) and proc.exitCode() == 0:
-            top = bytes(proc.readAllStandardOutput()).decode("utf-8", errors="replace").strip()
-            if top and os.path.isdir(top):
-                self.repo_dir = top
+        # Walking parent markers avoids spawning and synchronously waiting for Git
+        # on the UI thread at startup, and supports linked worktrees (.git files).
+        while True:
+            if os.path.exists(os.path.join(target, ".git")):
+                self.repo_dir = target
+                break
+            parent = os.path.dirname(target)
+            if parent == target:
+                break
+            target = parent
 
     def is_repo(self) -> bool:
         """Checks if current directory is inside a Git repository."""
-        return os.path.isdir(os.path.join(self.repo_dir, ".git"))
+        return os.path.exists(os.path.join(self.repo_dir, ".git"))
 
     def stop_all(self):
         """Terminates active background git processes."""

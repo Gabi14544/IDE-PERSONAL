@@ -38,7 +38,6 @@ class GitPanel(QWidget):
 
         self._init_ui()
         self._connect_signals()
-        self.refresh_all()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -196,5 +195,11 @@ class GitPanel(QWidget):
             }}
         """)
 
-        # Re-color existing branch items with new theme
-        self.git_manager.refresh_branches()
+        # Recolor existing rows without starting Git processes during a theme change.
+        for index in range(self.list_branches.count()):
+            item = self.list_branches.item(index)
+            name = item.data(Qt.ItemDataRole.UserRole)
+            color = th["green"] if name == self.git_manager.current_branch else (
+                text_muted if name.startswith("remotes/") else text
+            )
+            item.setForeground(QColor(color))
