@@ -47,30 +47,30 @@ IGNORED_EXTENSIONS = {
     ".sqlite3-journal",
 }
 
-# Dark theme palette (Catppuccin Mocha inspired for low eye strain)
+# Default theme palette (JetBrains Air Dark aligned with compatibility keys)
 THEME = {
-    "crust": "#11111b",
-    "mantle": "#181825",
-    "base": "#1e1e2e",
-    "surface0": "#313244",
-    "surface1": "#45475a",
-    "surface2": "#585b70",
-    "overlay0": "#6c7086",
-    "text": "#cdd6f4",
-    "subtext0": "#a6adc8",
-    "subtext1": "#bac2de",
-    "blue": "#89b4fa",
-    "green": "#a6e3a1",
-    "red": "#f38ba8",
+    "crust": "#111317",
+    "mantle": "#18191C",
+    "base": "#1E1F22",
+    "surface0": "#2B2D30",
+    "surface1": "#36383E",
+    "surface2": "#4E5157",
+    "overlay0": "#8C929D",
+    "text": "#E4E4E7",
+    "subtext0": "#A1A1AA",
+    "subtext1": "#CBD5E1",
+    "blue": "#3B82F6",
+    "green": "#59A869",
+    "red": "#E06C75",
     "peach": "#fab387",
-    "yellow": "#f9e2af",
+    "yellow": "#E5B567",
     "mauve": "#cba6f7",
-    "teal": "#94e2d5",
-    "caret": "#f5e0dc",
-    "selection": "#45475a",
-    "current_line": "#24273a",
-    "line_number_bg": "#181825",
-    "line_number_fg": "#6c7086",
+    "teal": "#2AACB8",
+    "caret": "#FFFFFF",
+    "selection": "#2E436E",
+    "current_line": "#26282E",
+    "line_number_bg": "#1E1F22",
+    "line_number_fg": "#4E5157",
 }
 
 # Autocomplete & Performance settings
@@ -85,6 +85,12 @@ class SettingsManager:
     def __init__(self):
         self._settings = QSettings(APP_ORG, "PyMintIDE")
 
+    def get_theme(self) -> str:
+        return str(self._settings.value("theme", "JetBrains Air Dark"))
+
+    def set_theme(self, theme_name: str):
+        self._settings.setValue("theme", theme_name)
+
     def get_last_directory(self) -> str:
         last = self._settings.value("last_directory", "")
         if last and os.path.isdir(str(last)):
@@ -97,11 +103,27 @@ class SettingsManager:
     def get_font_family(self) -> str:
         return str(self._settings.value("font_family", "Monospace"))
 
+    def set_font_family(self, family: str):
+        self._settings.setValue("font_family", family)
+
     def get_font_size(self) -> int:
-        return int(self._settings.value("font_size", 10))
+        return int(self._settings.value("font_size", 11))
+
+    def set_font_size(self, size: int):
+        self._settings.setValue("font_size", size)
 
     def get_tab_width(self) -> int:
         return int(self._settings.value("tab_width", 4))
+
+    def get_venv_python(self, project_dir: str = "") -> str:
+        """Finds .venv/bin/python inside the project directory or parent directories."""
+        current = project_dir or self.get_last_directory()
+        while current and current != os.path.dirname(current):
+            venv_py = os.path.join(current, ".venv", "bin", "python")
+            if os.path.isfile(venv_py) and os.access(venv_py, os.X_OK):
+                return venv_py
+            current = os.path.dirname(current)
+        return ""
 
     def get_uv_path(self) -> str:
         saved = self._settings.value("uv_path", "")
@@ -137,6 +159,42 @@ class SettingsManager:
             return str(saved)
         found = shutil.which("git")
         return found or "git"
+
+    def get_cargo_path(self) -> str:
+        saved = self._settings.value("cargo_path", "")
+        if saved and os.path.exists(str(saved)):
+            return str(saved)
+        found = shutil.which("cargo")
+        if found:
+            return found
+        cargo_bin = os.path.expanduser("~/.cargo/bin/cargo")
+        if os.path.exists(cargo_bin):
+            return cargo_bin
+        return "cargo"
+
+    def get_rustc_path(self) -> str:
+        saved = self._settings.value("rustc_path", "")
+        if saved and os.path.exists(str(saved)):
+            return str(saved)
+        found = shutil.which("rustc")
+        if found:
+            return found
+        rustc_bin = os.path.expanduser("~/.cargo/bin/rustc")
+        if os.path.exists(rustc_bin):
+            return rustc_bin
+        return "rustc"
+
+    def get_rustfmt_path(self) -> str:
+        saved = self._settings.value("rustfmt_path", "")
+        if saved and os.path.exists(str(saved)):
+            return str(saved)
+        found = shutil.which("rustfmt")
+        if found:
+            return found
+        rustfmt_bin = os.path.expanduser("~/.cargo/bin/rustfmt")
+        if os.path.exists(rustfmt_bin):
+            return rustfmt_bin
+        return "rustfmt"
 
     def get_recent_files(self) -> list:
         return self._settings.value("recent_files", []) or []

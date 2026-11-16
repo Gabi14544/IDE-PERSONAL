@@ -1,39 +1,40 @@
 """
-PyMint IDE - Git & GitHub Visual Panel
-Provides branch management, commit history ASCII graph, staging controls,
-diff inspection, and GitHub synchronization (Push/Pull/Fetch/Clone).
+PyMint IDE - Git Visual Panel (Minimalist Version)
+Displays only 2 clean sections:
+1. Ramas del Proyecto (Branches) with active branch highlighted.
+2. Últimos Commits (Recent Commits log graph).
+All modifications (commit, push, pull, add) are driven directly from the terminal.
 """
 
-import os
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QComboBox,
     QListWidget,
     QListWidgetItem,
     QPlainTextEdit,
-    QInputDialog,
-    QMessageBox,
-    QSplitter,
-    QGroupBox,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
-from core.config import THEME
 from core.git_manager import GitManager
+from core.config import settings
+from ui.themes import get_theme
 
 
 class GitPanel(QWidget):
-    """Side panel for Git operations and GitHub synchronization."""
+    """Side panel displaying Branches and Recent Commits."""
 
-    file_diff_requested = pyqtSignal(str, bool)
+    run_in_terminal_requested = pyqtSignal(str)
 
-    def __init__(self, git_manager: GitManager, parent=None):
+    def __init__(self, git_manager: GitManager, parent=None, theme_dict: dict = None):
         super().__init__(parent)
         self.git_manager = git_manager
+        if isinstance(theme_dict, dict):
+            self.theme = theme_dict
+        else:
+            self.theme = get_theme(settings.get_theme())
 
         self._init_ui()
         self._connect_signals()
@@ -42,229 +43,158 @@ class GitPanel(QWidget):
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
-        # Header: Branch Selector & Sync Actions
-        branch_box = QGroupBox("Branches & GitHub Sync")
-        branch_layout = QVBoxLayout(branch_box)
-        branch_layout.setSpacing(6)
+        # -------------------------------------------------------------
+        # SECCIÓN 1: RAMAS (BRANCHES)
+        # -------------------------------------------------------------
+        header_branches = QHBoxLayout()
+        header_branches.setSpacing(6)
 
-        # Branch row
-        row_branch = QHBoxLayout()
-        self.lbl_branch = QLabel("Branch:")
-        self.lbl_branch.setStyleSheet(f"font-weight: bold; color: {THEME['text']};")
-        row_branch.addWidget(self.lbl_branch)
+        self.lbl_branches = QLabel("RAMAS (BRANCHES)")
+        self.lbl_branches.setStyleSheet("font-weight: bold; font-size: 11px; letter-spacing: 0.5px;")
+        header_branches.addWidget(self.lbl_branches)
 
-        self.combo_branches = QComboBox()
-        self.combo_branches.setStyleSheet(f"""
-            QComboBox {{
-                background-color: {THEME['surface0']};
-                color: {THEME['blue']};
-                border: 1px solid {THEME['surface1']};
-                padding: 3px 6px;
-                border-radius: 3px;
-                font-weight: bold;
-            }}
-            QComboBox QAbstractItemView {{
-                background-color: {THEME['surface0']};
-                color: {THEME['text']};
-                selection-background-color: {THEME['surface1']};
-            }}
-        """)
-        self.combo_branches.currentTextChanged.connect(self._on_branch_selected)
-        row_branch.addWidget(self.combo_branches, stretch=1)
+        header_branches.addStretch()
 
-        btn_new_branch = QPushButton("+ New")
-        btn_new_branch.setToolTip("Create new branch (git checkout -b)")
-        btn_new_branch.setStyleSheet(f"background-color: {THEME['surface1']}; color: {THEME['text']}; border-radius: 3px; padding: 4px 8px;")
-        btn_new_branch.clicked.connect(self._on_create_branch)
-        row_branch.addWidget(btn_new_branch)
-        branch_layout.addLayout(row_branch)
+        self.btn_refresh = QPushButton("🔄 Actualizar")
+        self.btn_refresh.setToolTip("Refrescar ramas y commits")
+        self.btn_refresh.setFixedHeight(24)
+        self.btn_refresh.clicked.connect(self.refresh_all)
+        header_branches.addWidget(self.btn_refresh)
+        layout.addLayout(header_branches)
 
-        # Sync buttons row: Push, Pull, Fetch
-        row_sync = QHBoxLayout()
-        btn_fetch = QPushButton("🔄 Fetch")
-        btn_fetch.setStyleSheet(f"background-color: {THEME['surface0']}; color: {THEME['text']}; padding: 3px 6px; border-radius: 3px;")
-        btn_fetch.clicked.connect(self.git_manager.fetch)
-        row_sync.addWidget(btn_fetch)
+        self.list_branches = QListWidget()
+        self.list_branches.setMaximumHeight(140)
+        self.list_branches.itemDoubleClicked.connect(self._on_branch_double_clicked)
+        layout.addWidget(self.list_branches)
 
-        btn_pull = QPushButton("⬇ Pull")
-        btn_pull.setStyleSheet(f"background-color: {THEME['surface0']}; color: {THEME['teal']}; padding: 3px 6px; border-radius: 3px;")
-        btn_pull.clicked.connect(self.git_manager.pull)
-        row_sync.addWidget(btn_pull)
+        # -------------------------------------------------------------
+        # SECCIÓN 2: ÚLTIMOS COMMITS (RECENT COMMITS)
+        # -------------------------------------------------------------
+        self.lbl_commits = QLabel("ÚLTIMOS COMMITS")
+        self.lbl_commits.setStyleSheet("font-weight: bold; font-size: 11px; letter-spacing: 0.5px;")
+        layout.addWidget(self.lbl_commits)
 
-        btn_push = QPushButton("⬆ Push")
-        btn_push.setStyleSheet(f"background-color: {THEME['surface0']}; color: {THEME['peach']}; font-weight: bold; padding: 3px 6px; border-radius: 3px;")
-        btn_push.clicked.connect(self.git_manager.push)
-        row_sync.addWidget(btn_push)
+        self.txt_commits = QPlainTextEdit()
+        self.txt_commits.setReadOnly(True)
+        self.txt_commits.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.txt_commits.setFont(QFont("Monospace", 9))
+        layout.addWidget(self.txt_commits, stretch=1)
 
-        btn_clone = QPushButton("🔗 Clone")
-        btn_clone.setStyleSheet(f"background-color: {THEME['surface0']}; color: {THEME['mauve']}; padding: 3px 6px; border-radius: 3px;")
-        btn_clone.clicked.connect(self._on_clone_clicked)
-        row_sync.addWidget(btn_clone)
-
-        branch_layout.addLayout(row_sync)
-        layout.addWidget(branch_box)
-
-        # Staging & Changes
-        stage_box = QGroupBox("Changes & Staging")
-        stage_layout = QVBoxLayout(stage_box)
-        stage_layout.setSpacing(4)
-
-        # Stage / Unstage All buttons
-        row_stage_btns = QHBoxLayout()
-        btn_stage_all = QPushButton("Stage All (+)")
-        btn_stage_all.setStyleSheet(f"background-color: {THEME['green']}; color: {THEME['crust']}; font-weight: bold; padding: 3px 6px; border-radius: 3px;")
-        btn_stage_all.clicked.connect(self.git_manager.stage_all)
-        row_stage_btns.addWidget(btn_stage_all)
-
-        btn_unstage_all = QPushButton("Unstage All (-)")
-        btn_unstage_all.setStyleSheet(f"background-color: {THEME['surface1']}; color: {THEME['text']}; padding: 3px 6px; border-radius: 3px;")
-        btn_unstage_all.clicked.connect(self.git_manager.unstage_all)
-        row_stage_btns.addWidget(btn_unstage_all)
-
-        btn_refresh = QPushButton("⟳")
-        btn_refresh.setFixedSize(24, 22)
-        btn_refresh.setStyleSheet(f"background-color: {THEME['surface0']}; color: {THEME['text']}; border-radius: 3px;")
-        btn_refresh.clicked.connect(self.refresh_all)
-        row_stage_btns.addWidget(btn_refresh)
-        stage_layout.addLayout(row_stage_btns)
-
-        # Staged files list
-        stage_layout.addWidget(QLabel("<font color='#a6e3a1'><b>Staged Changes:</b></font>"))
-        self.list_staged = QListWidget()
-        self.list_staged.setStyleSheet(f"background-color: {THEME['mantle']}; color: {THEME['text']}; border: 1px solid {THEME['surface0']}; font-size: 11px;")
-        self.list_staged.itemDoubleClicked.connect(self._on_staged_item_clicked)
-        stage_layout.addWidget(self.list_staged, stretch=1)
-
-        # Unstaged files list
-        stage_layout.addWidget(QLabel("<font color='#fab387'><b>Working Tree Changes:</b></font>"))
-        self.list_unstaged = QListWidget()
-        self.list_unstaged.setStyleSheet(f"background-color: {THEME['mantle']}; color: {THEME['text']}; border: 1px solid {THEME['surface0']}; font-size: 11px;")
-        self.list_unstaged.itemDoubleClicked.connect(self._on_unstaged_item_clicked)
-        stage_layout.addWidget(self.list_unstaged, stretch=1)
-
-        # Commit input and button
-        self.txt_commit = QPlainTextEdit()
-        self.txt_commit.setPlaceholderText("Commit message (Ctrl+Enter to commit)")
-        self.txt_commit.setMaximumHeight(50)
-        self.txt_commit.setStyleSheet(f"background-color: {THEME['surface0']}; color: {THEME['text']}; border: 1px solid {THEME['surface1']}; border-radius: 3px;")
-        stage_layout.addWidget(self.txt_commit)
-
-        btn_commit = QPushButton("✔ Commit")
-        btn_commit.setStyleSheet(f"background-color: {THEME['blue']}; color: {THEME['crust']}; font-weight: bold; padding: 5px; border-radius: 4px;")
-        btn_commit.clicked.connect(self._on_commit_clicked)
-        stage_layout.addWidget(btn_commit)
-
-        layout.addWidget(stage_box, stretch=2)
-
-        # Visual Commit History Graph
-        graph_box = QGroupBox("Git History Graph (git log --graph)")
-        graph_layout = QVBoxLayout(graph_box)
-        self.txt_graph = QPlainTextEdit()
-        self.txt_graph.setReadOnly(True)
-        self.txt_graph.setFont(QFont("Monospace", 9))
-        self.txt_graph.setStyleSheet(f"""
-            QPlainTextEdit {{
-                background-color: {THEME['mantle']};
-                color: {THEME['teal']};
-                border: 1px solid {THEME['surface0']};
-            }}
-        """)
-        graph_layout.addWidget(self.txt_graph)
-        layout.addWidget(graph_box, stretch=1)
-
-        self._apply_theme()
-
-    def _apply_theme(self):
-        self.setStyleSheet(f"""
-            QWidget {{
-                background-color: {THEME['base']};
-                color: {THEME['text']};
-            }}
-            QGroupBox {{
-                border: 1px solid {THEME['surface0']};
-                border-radius: 4px;
-                margin-top: 8px;
-                padding-top: 8px;
-                font-weight: bold;
-                font-size: 11px;
-                color: {THEME['subtext1']};
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 8px;
-                padding: 0 4px;
-            }}
-        """)
+        self.apply_theme(self.theme)
 
     def _connect_signals(self):
         self.git_manager.branches_updated.connect(self._on_branches_updated)
-        self.git_manager.status_updated.connect(self._on_status_updated)
-        self.git_manager.log_graph_updated.connect(self._on_graph_updated)
-        self.git_manager.command_finished.connect(self._on_command_finished)
+        self.git_manager.log_graph_updated.connect(self._on_commits_updated)
 
     def refresh_all(self):
+        """Fetches branches and commit history."""
         self.git_manager.refresh_branches()
-        self.git_manager.refresh_status()
         self.git_manager.refresh_log_graph()
 
     def _on_branches_updated(self, current: str, branches: list):
-        self.combo_branches.blockSignals(True)
-        self.combo_branches.clear()
-        for b in branches:
-            self.combo_branches.addItem(b)
-        self.combo_branches.setCurrentText(current)
-        self.combo_branches.blockSignals(False)
+        self.list_branches.clear()
+        th = self.theme
+        color_active = QColor(th.get("green", "#59A869"))
+        color_remote = QColor(th.get("text_muted", "#8C929D"))
+        color_local = QColor(th.get("text", "#E4E4E7"))
 
-    def _on_branch_selected(self, branch: str):
+        for b in branches:
+            clean = b.strip()
+            item = QListWidgetItem()
+
+            if clean.startswith("* "):
+                name = clean[2:].strip()
+                item.setText(f"● {name} (activa)")
+                item.setForeground(color_active)
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
+            elif clean.startswith("remotes/"):
+                item.setText(f"  {clean}")
+                item.setForeground(color_remote)
+            else:
+                item.setText(f"  {clean}")
+                item.setForeground(color_local)
+
+            item.setData(Qt.ItemDataRole.UserRole, clean.replace("* ", "").strip())
+            self.list_branches.addItem(item)
+
+    def _on_branch_double_clicked(self, item: QListWidgetItem):
+        branch = item.data(Qt.ItemDataRole.UserRole)
         if branch:
             self.git_manager.checkout_branch(branch)
 
-    def _on_create_branch(self):
-        name, ok = QInputDialog.getText(self, "New Branch", "Branch name:")
-        if ok and name.strip():
-            self.git_manager.create_branch(name.strip())
+    def _on_commits_updated(self, text: str):
+        self.txt_commits.setPlainText(text)
 
-    def _on_clone_clicked(self):
-        url, ok = QInputDialog.getText(self, "Clone Repository", "Git/GitHub Repository URL:")
-        if ok and url.strip():
-            target_dir = os.path.join(os.path.dirname(self.git_manager.repo_dir), os.path.basename(url.strip()).replace(".git", ""))
-            self.git_manager.clone(url.strip(), target_dir)
+    def apply_theme(self, theme_dict: dict):
+        """Applies active theme styling, preventing white-on-white text."""
+        self.theme = theme_dict
+        th = self.theme
+        card_bg = th.get("card_bg", "#1E1F22")
+        card_border = th.get("card_border", "#2B2D30")
+        text = th.get("text", "#E4E4E7")
+        text_muted = th.get("text_muted", "#8C929D")
+        surface = th.get("surface", "#2B2D30")
+        surface_hover = th.get("surface_hover", "#36383E")
+        accent = th.get("accent", "#3B82F6")
 
-    def _on_status_updated(self, staged: list, unstaged: list):
-        self.list_staged.clear()
-        for item in staged:
-            self.list_staged.addItem(f"[{item['status']}] {item['file']}")
+        self.lbl_branches.setStyleSheet(f"color: {text_muted}; font-weight: bold; font-size: 11px;")
+        self.lbl_commits.setStyleSheet(f"color: {text_muted}; font-weight: bold; font-size: 11px;")
 
-        self.list_unstaged.clear()
-        for item in unstaged:
-            self.list_unstaged.addItem(f"[{item['status']}] {item['file']}")
+        self.list_branches.setStyleSheet(f"""
+            QListWidget {{
+                background-color: {surface};
+                color: {text};
+                border: 1px solid {card_border};
+                border-radius: 6px;
+                padding: 4px;
+                outline: none;
+                font-size: 12px;
+            }}
+            QListWidget::item {{
+                padding: 4px 6px;
+                border-radius: 4px;
+            }}
+            QListWidget::item:hover {{
+                background-color: {surface_hover};
+            }}
+            QListWidget::item:selected {{
+                background-color: {card_bg};
+                color: {accent};
+                border: 1px solid {accent};
+            }}
+        """)
 
-    def _on_staged_item_clicked(self, item: QListWidgetItem):
-        # Double clicking staged file un-stages it
-        text = item.text()
-        filename = text.split("] ", 1)[-1].strip()
-        self.git_manager.unstage_file(filename)
+        self.txt_commits.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background-color: {surface};
+                color: {text};
+                border: 1px solid {card_border};
+                border-radius: 6px;
+                padding: 6px;
+                font-family: monospace;
+                font-size: 11px;
+            }}
+        """)
 
-    def _on_unstaged_item_clicked(self, item: QListWidgetItem):
-        # Double clicking unstaged file stages it
-        text = item.text()
-        filename = text.split("] ", 1)[-1].strip()
-        self.git_manager.stage_file(filename)
+        self.btn_refresh.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {surface};
+                color: {text};
+                border: 1px solid {card_border};
+                border-radius: 5px;
+                padding: 2px 8px;
+                font-size: 11px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: {surface_hover};
+                border-color: {accent};
+            }}
+        """)
 
-    def _on_commit_clicked(self):
-        msg = self.txt_commit.toPlainText().strip()
-        if not msg:
-            QMessageBox.warning(self, "Commit", "Please enter a commit message.")
-            return
-        self.git_manager.commit(msg)
-        self.txt_commit.clear()
-
-    def _on_graph_updated(self, graph_text: str):
-        self.txt_graph.setPlainText(graph_text)
-
-    def _on_command_finished(self, cmd_name: str, success: bool, msg: str):
-        if not success and msg:
-            # Show brief notice without modal freezing
-            pass
+        # Re-color existing branch items with new theme
+        self.git_manager.refresh_branches()

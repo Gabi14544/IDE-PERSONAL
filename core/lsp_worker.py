@@ -4,14 +4,44 @@ Handles code completions and signature help in background without blocking Qt UI
 """
 
 import sys
-from PyQt6.QtCore import QThread, pyqtSignal, QMutex, QWaitCondition
 import os
+import re
+from PyQt6.QtCore import QThread, pyqtSignal, QMutex, QWaitCondition
 
 try:
     import jedi
     JEDI_AVAILABLE = True
 except ImportError:
     JEDI_AVAILABLE = False
+
+
+def format_universal_signature(sig) -> str:
+    """Universal signature formatter keeping signatures clean, lightweight and strictly 1-line."""
+    try:
+        params = []
+        sig_params = getattr(sig, "params", [])
+        for p in sig_params[:7]:  # Máximo 7 parámetros visibles
+            raw_desc = getattr(p, "description", "") or getattr(p, "name", "")
+            # Tomar solo la primera línea sin bloques Doc() ni Annotated[]
+            desc = str(raw_desc).replace("param ", "").strip()
+            desc = re.sub(r'Doc\(.*?\)', '', desc, flags=re.DOTALL)
+            desc = re.sub(r'Annotated\[\s*([^,\]]+).*?\]', r'\1', desc, flags=re.DOTALL)
+            desc = " ".join(desc.split())
+            # Si la anotación de tipo del parámetro sigue siendo larga, dejar solo el nombre del parámetro
+            param_name = getattr(p, "name", desc)
+            if len(desc) > 25 or not desc:
+                desc = param_name
+            params.append(desc)
+        if len(sig_params) > 7:
+            params.append("...")
+        sig_name = getattr(sig, "name", "call")
+        result = f"{sig_name}({', '.join(params)})"
+        if len(result) > 90:
+            result = result[:86] + "...)"
+        return result
+    except Exception:
+        name = getattr(sig, "name", "function")
+        return f"{name}(...)"
 
 
 class CompletionRequest:
@@ -125,7 +155,7 @@ class LSPWorker(QThread):
                     signatures = script.get_signatures(req.line, req.col)
                     if signatures:
                         sig = signatures[0]
-                        sig_text = sig.to_string()
+                        sig_text = format_universal_signature(sig)
                         self.signature_ready.emit(req.req_id, sig_text)
                 except Exception:
                     pass

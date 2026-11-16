@@ -1,7 +1,7 @@
 """
 PyMint IDE - Editor Tabs Manager
 Handles multiple open files, tab switching, modification indicators (*),
-saving, and lint/formatting integration.
+saving, and lint/formatting integration with dynamic theme switching.
 """
 
 import os
@@ -13,11 +13,12 @@ from PyQt6.QtWidgets import (
     QLabel,
 )
 from PyQt6.QtCore import pyqtSignal, Qt
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QIcon, QFont
 
 from ui.code_editor import CodeEditor
 from core.linter_runner import LinterRunner
-from core.config import settings, THEME
+from core.config import settings
+from ui.themes import get_theme
 
 
 class EditorTabs(QTabWidget):
@@ -28,9 +29,10 @@ class EditorTabs(QTabWidget):
     active_editor_changed = pyqtSignal(object)  # CodeEditor or None
     status_message_requested = pyqtSignal(str)
 
-    def __init__(self, lsp_worker=None, parent=None):
+    def __init__(self, lsp_worker=None, theme_dict: dict = None, parent=None):
         super().__init__(parent)
         self.lsp_worker = lsp_worker
+        self.theme = theme_dict or get_theme(settings.get_theme())
         self.linter = LinterRunner(self)
         self.setTabsClosable(True)
         self.setMovable(True)
@@ -52,37 +54,50 @@ class EditorTabs(QTabWidget):
         self.linter.stop_all()
 
     def _apply_tab_style(self):
-        """Catppuccin dark tab bar styling."""
+        """Card-themed tab bar styling with rounded tab tops and clear active state."""
+        th = self.theme
+        card_bg = th["card_bg"]
+        card_border = th["card_border"]
+        header_bg = th["header_bg"]
+        text = th["text"]
+        text_muted = th["text_muted"]
+        accent = th["accent"]
+        surface = th["surface"]
+
         self.setStyleSheet(f"""
             QTabWidget::pane {{
-                border: 1px solid {THEME["surface0"]};
-                background: {THEME["base"]};
+                border: none;
+                background: {card_bg};
             }}
             QTabBar::tab {{
-                background: {THEME["mantle"]};
-                color: {THEME["subtext0"]};
+                background: {header_bg};
+                color: {text_muted};
                 padding: 6px 14px;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-                border: 1px solid {THEME["surface0"]};
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                border: 1px solid {card_border};
                 border-bottom: none;
                 margin-right: 2px;
                 font-size: 11px;
             }}
             QTabBar::tab:selected {{
-                background: {THEME["base"]};
-                color: {THEME["text"]};
-                border-bottom: 2px solid {THEME["blue"]};
+                background: {card_bg};
+                color: {accent};
+                border-top: 2px solid {accent};
+                font-weight: bold;
             }}
             QTabBar::tab:hover:!selected {{
-                background: {THEME["surface0"]};
-                color: {THEME["text"]};
-            }}
-            QTabBar::close-button {{
-                image: none;
-                subcontrol-position: right;
+                background: {surface};
+                color: {text};
             }}
         """)
+
+    def apply_theme(self, theme_dict: dict, font: QFont = None):
+        """Propagates theme and font to all open editors and updates tab styling."""
+        self.theme = theme_dict
+        self._apply_tab_style()
+        for editor in self._editors.values():
+            editor.apply_theme(theme_dict, font)
 
     def open_file(self, filepath: str) -> CodeEditor:
         """Opens a file in a new tab or switches to it if already open."""
@@ -104,7 +119,12 @@ class EditorTabs(QTabWidget):
             QMessageBox.critical(self, "Error opening file", f"Could not read {filepath}:\n{e}")
             return None
 
-        editor = CodeEditor(filepath=filepath, lsp_worker=self.lsp_worker, parent=self)
+        editor = CodeEditor(
+            filepath=filepath,
+            lsp_worker=self.lsp_worker,
+            theme_dict=self.theme,
+            parent=self,
+        )
         editor.setText(content)
         editor.setModified(False)
 
@@ -124,14 +144,14 @@ class EditorTabs(QTabWidget):
         settings.add_recent_file(filepath)
         self.file_opened.emit(filepath)
 
-        # Run initial linter check if python
-        if filepath.endswith(".py"):
+        # Run initial linter check if python or rust
+        if filepath.endswith(".py") or filepath.endswith(".rs"):
             self.linter.check_file(filepath)
 
         return editor
 
     def save_file(self, filepath: str = None) -> bool:
-        """Saves file to disk, clears dirty state, and runs ruff check."""
+        """Saves file to disk, clears dirty state, and runs linter check."""
         if not filepath:
             editor = self.current_editor()
             if not editor:
@@ -150,8 +170,8 @@ class EditorTabs(QTabWidget):
             self.status_message_requested.emit(f"Saved: {os.path.basename(filepath)}")
             self.file_saved.emit(filepath)
 
-            # Trigger Ruff linting
-            if filepath.endswith(".py"):
+            # Trigger linting
+            if filepath.endswith(".py") or filepath.endswith(".rs"):
                 self.linter.check_file(filepath)
             return True
         except Exception as e:
@@ -165,7 +185,7 @@ class EditorTabs(QTabWidget):
                 self.save_file(filepath)
 
     def format_file(self, filepath: str = None):
-        """Asynchronously formats the file using Ruff."""
+        """Asynchronously formats the file using Ruff (Python) or rustfmt (Rust)."""
         if not filepath:
             editor = self.current_editor()
             if not editor:
@@ -176,12 +196,14 @@ class EditorTabs(QTabWidget):
             return
 
         editor = self._editors[filepath]
-        if not filepath.endswith(".py"):
-            self.status_message_requested.emit("Ruff format only supports Python files")
-            return
-
-        self.status_message_requested.emit(f"Formatting {os.path.basename(filepath)} with Ruff...")
-        self.linter.format_code(filepath, editor.text())
+        if filepath.endswith(".py"):
+            self.status_message_requested.emit(f"Formatting {os.path.basename(filepath)} with Ruff...")
+            self.linter.format_code(filepath, editor.text())
+        elif filepath.endswith(".rs"):
+            self.status_message_requested.emit(f"Formatting {os.path.basename(filepath)} with rustfmt...")
+            self.linter.format_code(filepath, editor.text())
+        else:
+            self.status_message_requested.emit("Format only supports Python and Rust files")
 
     def _on_format_completed(self, filepath: str, success: bool, output: str):
         """Replaces buffer with formatted code while preserving cursor position."""
@@ -199,18 +221,10 @@ class EditorTabs(QTabWidget):
     def _on_lint_completed(self, filepath: str, diagnostics: list):
         """Applies Ruff diagnostics markers to editor."""
         if filepath in self._editors:
-            editor = self._editors[filepath]
-            editor.set_diagnostics(diagnostics)
-            if diagnostics:
-                count = len(diagnostics)
-                self.status_message_requested.emit(
-                    f"{os.path.basename(filepath)}: {count} lint issue{'s' if count > 1 else ''}"
-                )
-            else:
-                self.status_message_requested.emit(f"{os.path.basename(filepath)}: No lint issues (clean)")
+            self._editors[filepath].set_diagnostics(diagnostics)
 
     def _on_modification_changed(self, filepath: str, modified: bool):
-        """Update tab text with '*' indicator when file is dirty."""
+        """Appends asterisk (*) to tab text when file is modified."""
         self._modified_states[filepath] = modified
         if filepath in self._editors:
             editor = self._editors[filepath]
@@ -218,41 +232,41 @@ class EditorTabs(QTabWidget):
             if index != -1:
                 title = os.path.basename(filepath)
                 if modified:
-                    title = f"● {title}"
+                    title += " *"
                 self.setTabText(index, title)
 
+    def _on_current_tab_changed(self, index: int):
+        editor = self.widget(index) if index != -1 else None
+        self.active_editor_changed.emit(editor)
+        if editor and isinstance(editor, CodeEditor):
+            editor.setFocus()
+
+    def current_editor(self) -> CodeEditor:
+        widget = self.currentWidget()
+        return widget if isinstance(widget, CodeEditor) else None
+
     def close_tab(self, index: int) -> bool:
-        """Closes tab, prompting if unsaved changes exist."""
+        """Prompts to save if modified before closing."""
         widget = self.widget(index)
         if not isinstance(widget, CodeEditor):
             return True
 
         filepath = widget.filepath
         if self._modified_states.get(filepath, False):
-            reply = QMessageBox.question(
+            resp = QMessageBox.question(
                 self,
                 "Unsaved Changes",
                 f"File '{os.path.basename(filepath)}' has unsaved changes.\nDo you want to save before closing?",
                 QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Save,
             )
-            if reply == QMessageBox.StandardButton.Save:
+            if resp == QMessageBox.StandardButton.Save:
                 if not self.save_file(filepath):
                     return False
-            elif reply == QMessageBox.StandardButton.Cancel:
+            elif resp == QMessageBox.StandardButton.Cancel:
                 return False
 
         self.removeTab(index)
         self._editors.pop(filepath, None)
         self._modified_states.pop(filepath, None)
-        widget.deleteLater()
         return True
-
-    def current_editor(self) -> CodeEditor:
-        """Returns currently active CodeEditor or None."""
-        widget = self.currentWidget()
-        return widget if isinstance(widget, CodeEditor) else None
-
-    def _on_current_tab_changed(self, index: int):
-        """Emit active editor changed."""
-        self.active_editor_changed.emit(self.current_editor())

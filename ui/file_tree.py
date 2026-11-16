@@ -121,30 +121,41 @@ class FileTreePanel(QWidget):
         self._apply_style()
         layout.addWidget(self.tree_view)
 
-    def _apply_style(self):
+    def _apply_style(self, theme_dict: dict = None):
+        th = theme_dict or THEME
+        bg = th.get("card_bg", th.get("mantle", "#1E1F22"))
+        text = th.get("text", "#E4E4E7")
+        surface = th.get("surface", th.get("surface0", "#2B2D30"))
+        surface_hover = th.get("surface_hover", th.get("surface1", "#36383E"))
+        accent = th.get("accent", th.get("blue", "#3B82F6"))
+
         self.setStyleSheet(f"""
             QWidget {{
-                background-color: {THEME['mantle']};
-                color: {THEME['text']};
+                background-color: transparent;
+                color: {text};
             }}
             QTreeView {{
-                background-color: {THEME['mantle']};
-                color: {THEME['text']};
+                background-color: transparent;
+                color: {text};
                 border: none;
                 font-size: 12px;
             }}
             QTreeView::item {{
                 padding: 3px 4px;
-                border-radius: 3px;
+                border-radius: 4px;
             }}
             QTreeView::item:hover {{
-                background-color: {THEME['surface0']};
+                background-color: {surface};
             }}
             QTreeView::item:selected {{
-                background-color: {THEME['surface1']};
-                color: {THEME['blue']};
+                background-color: {surface_hover};
+                color: {accent};
+                font-weight: bold;
             }}
         """)
+
+    def apply_theme(self, theme_dict: dict):
+        self._apply_style(theme_dict)
 
     def set_root_path(self, path: str):
         """Set root path for explorer tree."""
